@@ -1,8 +1,6 @@
 package handlers
 
 import (
-	"time"
-
 	"github.com/gofiber/fiber/v2"
 	"gorm.io/gorm"
 
@@ -15,67 +13,76 @@ import (
 type DashboardHandler struct {
 	db    *gorm.DB
 	stats *analytics.Service
+	orgID string
 }
 
-func NewDashboardHandler(db *gorm.DB, stats *analytics.Service) *DashboardHandler {
-	return &DashboardHandler{db: db, stats: stats}
+func NewDashboardHandler(db *gorm.DB, stats *analytics.Service, orgID string) *DashboardHandler {
+	return &DashboardHandler{db: db, stats: stats, orgID: orgID}
 }
 
-// period reads ?month=YYYY-MM, defaulting to the current month.
-func period(c *fiber.Ctx) string {
-	if m := c.Query("month"); len(m) == 7 {
-		return m
+// resolvePeriod reads ?period=<id>, defaulting to the org's latest survey period.
+func (h *DashboardHandler) resolvePeriod(c *fiber.Ctx) (*models.SurveyPeriod, error) {
+	if id := c.Query("period"); id != "" {
+		return h.stats.PeriodByID(id)
 	}
-	return analytics.CurrentPeriod()
-}
-
-func previousMonth(p string) string {
-	t, err := time.Parse("2006-01", p)
-	if err != nil {
-		return p
-	}
-	return t.AddDate(0, -1, 0).Format("2006-01")
+	return h.stats.LatestPeriod()
 }
 
 // HRKpis serves the five KPI cards plus the six-month trend.
 func (h *DashboardHandler) HRKpis(c *fiber.Ctx) error {
-	p := period(c)
-
-	enps, err := h.stats.ENPS(p)
+	period, err := h.resolvePeriod(c)
 	if err != nil {
-		return err
-	}
-	prevENPS, err := h.stats.ENPS(previousMonth(p))
-	if err != nil {
-		return err
-	}
-	satisfaction, err := h.stats.SatisfactionAverage(p)
-	if err != nil {
-		return err
-	}
-	prevSatisfaction, err := h.stats.SatisfactionAverage(previousMonth(p))
-	if err != nil {
-		return err
-	}
-	burnoutPct, deptsAtRisk, err := h.stats.BurnoutRisk(p)
-	if err != nil {
-		return err
-	}
-	sentiment, err := h.stats.SentimentSplit(p)
-	if err != nil {
-		return err
-	}
-	trend, err := h.stats.Trend(p, 6)
-	if err != nil {
-		return err
+		return fiber.NewError(fiber.StatusNotFound, "no survey period found")
 	}
 
-	responded, err := h.stats.TotalRespondents(p)
+	enps, err := h.stats.ENPS(period.ID)
+	if err != nil {
+		return err
+	}
+	prevENPSValue := 0
+	if prev, err := h.stats.PreviousPeriod(period); err != nil {
+		return err
+	} else if prev != nil {
+		prevENPS, err := h.stats.ENPS(prev.ID)
+		if err != nil {
+			return err
+		}
+		prevENPSValue = prevENPS.Value
+	}
+
+	satisfaction, err := h.stats.SatisfactionAverage(period.ID)
+	if err != nil {
+		return err
+	}
+	prevSatisfaction := 0.0
+	if prev, err := h.stats.PreviousPeriod(period); err != nil {
+		return err
+	} else if prev != nil {
+		prevSatisfaction, err = h.stats.SatisfactionAverage(prev.ID)
+		if err != nil {
+			return err
+		}
+	}
+
+	burnoutPct, deptsAtRisk, err := h.stats.BurnoutRisk(period.ID)
+	if err != nil {
+		return err
+	}
+	sentiment, err := h.stats.SentimentSplit(period.ID)
+	if err != nil {
+		return err
+	}
+	trend, err := h.stats.Trend(period, 6)
+	if err != nil {
+		return err
+	}
+
+	responded, err := h.stats.TotalRespondents(period.ID)
 	if err != nil {
 		return err
 	}
 	var headcount int64
-	if err := h.db.Model(&models.User{}).Count(&headcount).Error; err != nil {
+	if err := h.db.Model(&models.User{}).Where("org_id = ? AND is_active = ?", h.orgID, true).Count(&headcount).Error; err != nil {
 		return err
 	}
 	responseRate := 0
@@ -86,7 +93,7 @@ func (h *DashboardHandler) HRKpis(c *fiber.Ctx) error {
 	return c.JSON(dto.HrKpis{
 		Enps: dto.EnpsKpi{
 			Value:            enps.Value,
-			DeltaVsLastMonth: enps.Value - prevENPS.Value,
+			DeltaVsLastMonth: enps.Value - prevENPSValue,
 		},
 		Satisfaction: dto.SatisfactionKpi{
 			Value: satisfaction,
@@ -121,10 +128,13 @@ func trendDirection(current, previous float64) string {
 // come back with respondentCount set and every cell suppressed, so the client renders its
 // "hidden for privacy" row without ever having received a score.
 func (h *DashboardHandler) Heatmap(c *fiber.Ctx) error {
-	p := period(c)
+	period, err := h.resolvePeriod(c)
+	if err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "no survey period found")
+	}
 
 	var departments []models.Department
-	if err := h.db.Order("id").Find(&departments).Error; err != nil {
+	if err := h.db.Where("org_id = ?", h.orgID).Order("id").Find(&departments).Error; err != nil {
 		return err
 	}
 	var topics []models.Topic
@@ -132,11 +142,11 @@ func (h *DashboardHandler) Heatmap(c *fiber.Ctx) error {
 		return err
 	}
 
-	scores, err := h.stats.DepartmentTopicScores(p)
+	scores, err := h.stats.DepartmentTopicScores(period.ID, topics)
 	if err != nil {
 		return err
 	}
-	counts, err := h.stats.RespondentCounts(p)
+	counts, err := h.stats.RespondentCounts(period.ID)
 	if err != nil {
 		return err
 	}
@@ -170,8 +180,12 @@ func (h *DashboardHandler) Heatmap(c *fiber.Ctx) error {
 
 // WordCloud serves terms from the analysis pipeline's output table.
 func (h *DashboardHandler) WordCloud(c *fiber.Ctx) error {
+	period, err := h.resolvePeriod(c)
+	if err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "no survey period found")
+	}
 	var terms []models.WordCloudTerm
-	err := h.db.Where("period_month = ?", period(c)).Order("frequency DESC").Find(&terms).Error
+	err = h.db.Where("org_id = ? AND period_id = ?", h.orgID, period.ID).Order("frequency DESC").Find(&terms).Error
 	if err != nil {
 		return err
 	}
@@ -180,25 +194,58 @@ func (h *DashboardHandler) WordCloud(c *fiber.Ctx) error {
 
 // Insight serves the AI summary panel and the urgent-issue list.
 func (h *DashboardHandler) Insight(c *fiber.Ctx) error {
-	p := period(c)
+	period, err := h.resolvePeriod(c)
+	if err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "no survey period found")
+	}
 
 	var insight models.AIInsight
-	if err := h.db.Where("period_month = ?", p).First(&insight).Error; err != nil {
+	if err := h.db.Where("org_id = ? AND period_id = ?", h.orgID, period.ID).First(&insight).Error; err != nil {
 		return fiber.NewError(fiber.StatusNotFound, "no insight generated for this period yet")
 	}
 
 	var urgent []models.UrgentIssue
-	if err := h.db.Where("period_month = ?", p).Order("rank").Find(&urgent).Error; err != nil {
+	if err := h.db.Where("org_id = ? AND period_id = ?", h.orgID, period.ID).Order("rank").Find(&urgent).Error; err != nil {
 		return err
 	}
 
 	return c.JSON(dto.NewInsight(&insight, urgent))
 }
 
+// Alerts serves the HR-only alerts panel, generating them on demand if they haven't been
+// computed for this period yet (no scheduler — same "on the fly" philosophy as the rest of
+// the dashboard).
+func (h *DashboardHandler) Alerts(c *fiber.Ctx) error {
+	period, err := h.resolvePeriod(c)
+	if err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "no survey period found")
+	}
+
+	var count int64
+	if err := h.db.Model(&models.Alert{}).Where("org_id = ? AND period_id = ?", h.orgID, period.ID).Count(&count).Error; err != nil {
+		return err
+	}
+	if count == 0 {
+		if err := h.stats.GenerateAlerts(period); err != nil {
+			return err
+		}
+	}
+
+	var alerts []models.Alert
+	err = h.db.Where("org_id = ? AND period_id = ?", h.orgID, period.ID).Order("severity DESC, created_at DESC").Find(&alerts).Error
+	if err != nil {
+		return err
+	}
+	return c.JSON(dto.NewAlerts(alerts))
+}
+
 // TopicDrilldown is HR-only: it is the one endpoint that returns sample text, and even
 // there the text was redacted before it was stored.
 func (h *DashboardHandler) TopicDrilldown(c *fiber.Ctx) error {
-	p := period(c)
+	period, err := h.resolvePeriod(c)
+	if err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "no survey period found")
+	}
 	topicID := c.Params("id")
 
 	var topic models.Topic
@@ -206,15 +253,15 @@ func (h *DashboardHandler) TopicDrilldown(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusNotFound, "unknown topic")
 	}
 
-	stats, err := h.stats.TopicStats(p, topicID)
+	stats, err := h.stats.TopicStats(period.ID, topicID)
 	if err != nil {
 		return err
 	}
-	trend, err := h.stats.TopicTrend(p, topicID, 6)
+	trend, err := h.stats.TopicTrend(period, topicID, 6)
 	if err != nil {
 		return err
 	}
-	sentiment, err := h.stats.SentimentSplit(p)
+	sentiment, err := h.stats.SentimentSplit(period.ID)
 	if err != nil {
 		return err
 	}
@@ -250,40 +297,47 @@ func (h *DashboardHandler) TopicDrilldown(c *fiber.Ctx) error {
 // ExecutiveSummary is aggregate-only by construction: dto.ExecutiveSummary has no field
 // that could carry an individual's words, so the restriction holds at the type level.
 func (h *DashboardHandler) ExecutiveSummary(c *fiber.Ctx) error {
-	p := period(c)
+	period, err := h.resolvePeriod(c)
+	if err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "no survey period found")
+	}
 
 	var topics []models.Topic
 	if err := h.db.Order("sort_order, id").Find(&topics).Error; err != nil {
 		return err
 	}
 	var departments []models.Department
-	if err := h.db.Order("id").Find(&departments).Error; err != nil {
+	if err := h.db.Where("org_id = ?", h.orgID).Order("id").Find(&departments).Error; err != nil {
+		return err
+	}
+	var positions []models.Position
+	if err := h.db.Where("org_id = ?", h.orgID).Order("id").Find(&positions).Error; err != nil {
 		return err
 	}
 
-	score, err := h.stats.OverallHealthScore(p)
+	score, err := h.stats.OverallHealthScore(period.ID)
 	if err != nil {
 		return err
 	}
-	sentiment, err := h.stats.SentimentSplit(p)
+	sentiment, err := h.stats.SentimentSplit(period.ID)
 	if err != nil {
 		return err
 	}
-	radar, err := h.stats.Radar(p, topics)
+	radar, err := h.stats.Radar(period, topics)
 	if err != nil {
 		return err
 	}
-	deptScores, err := h.stats.DepartmentAverages(p, departments)
+	deptScores, err := h.stats.DepartmentAverages(period.ID, departments)
 	if err != nil {
 		return err
 	}
-	tenure, err := h.stats.TenureAverages(p)
+	positionScores, err := h.stats.PositionAverages(period.ID, positions)
 	if err != nil {
 		return err
 	}
 
 	var decisions []models.DecisionItem
-	if err := h.db.Where("period_month = ?", p).Order("rank").Find(&decisions).Error; err != nil {
+	if err := h.db.Where("org_id = ? AND period_id = ?", h.orgID, period.ID).Order("rank").Find(&decisions).Error; err != nil {
 		return err
 	}
 
@@ -292,12 +346,12 @@ func (h *DashboardHandler) ExecutiveSummary(c *fiber.Ctx) error {
 		Sentiment:            sentiment,
 		Radar:                dto.NewRadar(radar),
 		DepartmentComparison: dto.NewDepartmentScores(deptScores),
-		TenureComparison:     dto.NewTenureScores(tenure),
+		PositionComparison:   dto.NewPositionScores(positionScores, positions),
 		DecisionItems:        dto.NewDecisionItems(decisions),
 	})
 }
 
-// Topics and Departments back the shared reference lists the frontend renders.
+// Topics, Departments, Positions back the shared reference lists the frontend renders.
 func (h *DashboardHandler) Topics(c *fiber.Ctx) error {
 	var topics []models.Topic
 	if err := h.db.Order("sort_order, id").Find(&topics).Error; err != nil {
@@ -307,13 +361,25 @@ func (h *DashboardHandler) Topics(c *fiber.Ctx) error {
 }
 
 func (h *DashboardHandler) Departments(c *fiber.Ctx) error {
+	period, err := h.resolvePeriod(c)
+	if err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "no survey period found")
+	}
 	var departments []models.Department
-	if err := h.db.Order("id").Find(&departments).Error; err != nil {
+	if err := h.db.Where("org_id = ?", h.orgID).Order("id").Find(&departments).Error; err != nil {
 		return err
 	}
-	counts, err := h.stats.RespondentCounts(period(c))
+	counts, err := h.stats.RespondentCounts(period.ID)
 	if err != nil {
 		return err
 	}
 	return c.JSON(dto.NewDepartments(departments, counts))
+}
+
+func (h *DashboardHandler) Positions(c *fiber.Ctx) error {
+	var positions []models.Position
+	if err := h.db.Where("org_id = ?", h.orgID).Order("id").Find(&positions).Error; err != nil {
+		return err
+	}
+	return c.JSON(dto.NewPositions(positions))
 }

@@ -34,6 +34,11 @@ func main() {
 		}
 	}
 
+	orgID, err := database.DefaultOrgID(db)
+	if err != nil {
+		log.Fatalf("database: %v", err)
+	}
+
 	app := fiber.New(fiber.Config{
 		AppName:      "MT-Sense API",
 		ErrorHandler: errorHandler,
@@ -50,7 +55,7 @@ func main() {
 		AllowCredentials: true,
 	}))
 
-	router.Register(app, db, cfg)
+	router.Register(app, db, cfg, orgID)
 
 	go func() {
 		if err := app.Listen(":" + cfg.Port); err != nil {

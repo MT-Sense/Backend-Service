@@ -20,16 +20,31 @@ func NewTopics(topics []models.Topic) []Topic {
 	return out
 }
 
+// Department.Name is a plain string, matching the single VARCHAR column in the given schema
+// (entity names are not localized — only UI chrome strings are, via i18n).
 type Department struct {
-	ID              string    `json:"id"`
-	Name            Localized `json:"name"`
-	RespondentCount int64     `json:"respondentCount"`
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	RespondentCount int64  `json:"respondentCount"`
 }
 
 func NewDepartments(departments []models.Department, counts map[string]int64) []Department {
 	out := make([]Department, 0, len(departments))
 	for _, d := range departments {
 		out = append(out, Department{ID: d.ID, Name: d.Name, RespondentCount: counts[d.ID]})
+	}
+	return out
+}
+
+type Position struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+func NewPositions(positions []models.Position) []Position {
+	out := make([]Position, 0, len(positions))
+	for _, p := range positions {
+		out = append(out, Position{ID: p.ID, Name: p.Name})
 	}
 	return out
 }
@@ -84,7 +99,7 @@ func NewTrend(points []analytics.TrendPoint) []TrendPoint {
 // --- heatmap ---
 
 type HeatmapCell struct {
-	TopicID string                 `json:"topicId"`
+	TopicID string                `json:"topicId"`
 	Score   Suppressible[float64] `json:"score"`
 }
 
@@ -218,9 +233,13 @@ type DepartmentScore struct {
 	Score        Suppressible[float64] `json:"score"`
 }
 
-type TenureScore struct {
-	Bucket string  `json:"bucket"`
-	Score  float64 `json:"score"`
+// PositionScore is this app's replacement for the old tenure-bucket breakdown — the given
+// schema tracks position, not tenure. Positions below n<5 are simply absent from the list
+// (see analytics.PositionAverages).
+type PositionScore struct {
+	PositionID string  `json:"positionId"`
+	Name       string  `json:"name"`
+	Score      float64 `json:"score"`
 }
 
 type DecisionItem struct {
@@ -238,7 +257,7 @@ type ExecutiveSummary struct {
 	Sentiment            Sentiment         `json:"sentiment"`
 	Radar                []RadarAxis       `json:"radar"`
 	DepartmentComparison []DepartmentScore `json:"departmentComparison"`
-	TenureComparison     []TenureScore     `json:"tenureComparison"`
+	PositionComparison   []PositionScore   `json:"positionComparison"`
 	DecisionItems        []DecisionItem    `json:"decisionItems"`
 }
 
@@ -258,10 +277,14 @@ func NewDepartmentScores(scores []analytics.DepartmentScore) []DepartmentScore {
 	return out
 }
 
-func NewTenureScores(scores []analytics.TenureScore) []TenureScore {
-	out := make([]TenureScore, 0, len(scores))
+func NewPositionScores(scores []analytics.PositionScore, positions []models.Position) []PositionScore {
+	names := make(map[string]string, len(positions))
+	for _, p := range positions {
+		names[p.ID] = p.Name
+	}
+	out := make([]PositionScore, 0, len(scores))
 	for _, s := range scores {
-		out = append(out, TenureScore{Bucket: s.Bucket, Score: s.Score})
+		out = append(out, PositionScore{PositionID: s.PositionID, Name: names[s.PositionID], Score: s.Score})
 	}
 	return out
 }
@@ -270,6 +293,32 @@ func NewDecisionItems(items []models.DecisionItem) []DecisionItem {
 	out := make([]DecisionItem, 0, len(items))
 	for _, i := range items {
 		out = append(out, DecisionItem{ID: i.ID, Rank: i.Rank, Label: i.Label, Severity: i.Severity})
+	}
+	return out
+}
+
+// --- alerts ---
+
+type Alert struct {
+	ID                   string  `json:"id"`
+	AlertType            string  `json:"alertType"`
+	Severity             string  `json:"severity"`
+	Message              string  `json:"message"`
+	RelatedDepartmentID  *string `json:"relatedDepartmentId,omitempty"`
+	RelatedPositionID    *string `json:"relatedPositionId,omitempty"`
+}
+
+func NewAlerts(alerts []models.Alert) []Alert {
+	out := make([]Alert, 0, len(alerts))
+	for _, a := range alerts {
+		out = append(out, Alert{
+			ID:                  a.ID,
+			AlertType:           string(a.AlertType),
+			Severity:            string(a.Severity),
+			Message:             a.Message,
+			RelatedDepartmentID: a.RelatedDepartmentID,
+			RelatedPositionID:   a.RelatedPositionID,
+		})
 	}
 	return out
 }

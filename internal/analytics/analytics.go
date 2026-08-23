@@ -1,12 +1,23 @@
 // Package analytics turns raw anonymous responses into the aggregates the dashboards show.
 //
-// Every query that groups by department, team or tenure carries `HAVING COUNT(*) >= 5`.
-// That is the primary n<5 gate and it runs in the database, so a small group's numbers are
-// never even loaded into memory. privacy.Suppress is applied on top as a second gate for
-// values assembled in Go.
+// Every query that groups by department or position carries `HAVING COUNT(*) >= 5`. That is
+// the primary n<5 gate and it runs in the database, so a small group's numbers are never even
+// loaded into memory. privacy.Suppress is applied on top as a second gate for values
+// assembled in Go.
+//
+// Under the fixed satisfaction_score(1-5)+comment_text survey model there is no per-topic
+// question anymore, so per-topic figures (the HR heatmap columns, the Executive radar axes,
+// topic drill-down) are derived from response_analysis.categories — the LLM-assigned topic
+// tags on each response's comment — rather than from dedicated per-topic questions. A cell's
+// "score" is the average satisfaction_score of respondents whose comment touched that theme,
+// in that department/period; this is documented as an approximation, same convention as the
+// other ponytail: heuristics in this codebase.
 package analytics
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
 	"time"
 
 	"gorm.io/gorm"
@@ -15,19 +26,81 @@ import (
 	"github.com/mt-sense/backend-service/internal/privacy"
 )
 
-type Service struct{ db *gorm.DB }
+type Service struct {
+	db    *gorm.DB
+	orgID string
+}
 
-func New(db *gorm.DB) *Service { return &Service{db: db} }
+func New(db *gorm.DB, orgID string) *Service { return &Service{db: db, orgID: orgID} }
 
-// CurrentPeriod is the YYYY-MM the dashboards default to.
-func CurrentPeriod() string { return time.Now().Format("2006-01") }
+func periodLabel(p models.SurveyPeriod) string {
+	return fmt.Sprintf("%04d-%02d", p.Year, p.Month)
+}
 
-func previousPeriod(period string) string {
-	t, err := time.Parse("2006-01", period)
+// LatestPeriod is the most recent survey period (open or already closed) for the org —
+// dashboards default to it.
+func (s *Service) LatestPeriod() (*models.SurveyPeriod, error) {
+	var p models.SurveyPeriod
+	err := s.db.Where("org_id = ?", s.orgID).Order("year DESC, month DESC").First(&p).Error
 	if err != nil {
-		return period
+		return nil, err
 	}
-	return t.AddDate(0, -1, 0).Format("2006-01")
+	return &p, nil
+}
+
+// CurrentOpenPeriod returns the period currently accepting submissions
+// (opens_at <= now < closes_at), or nil if none is open.
+func (s *Service) CurrentOpenPeriod() (*models.SurveyPeriod, error) {
+	var p models.SurveyPeriod
+	now := time.Now()
+	err := s.db.Where("org_id = ? AND opens_at <= ? AND closes_at > ?", s.orgID, now, now).
+		Order("year DESC, month DESC").First(&p).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// PeriodByID loads a specific period, scoped to the org.
+func (s *Service) PeriodByID(id string) (*models.SurveyPeriod, error) {
+	var p models.SurveyPeriod
+	err := s.db.Where("org_id = ? AND id = ?", s.orgID, id).First(&p).Error
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// PreviousPeriod returns the period chronologically before the given one, or nil if there
+// isn't one yet.
+func (s *Service) PreviousPeriod(p *models.SurveyPeriod) (*models.SurveyPeriod, error) {
+	var prev models.SurveyPeriod
+	err := s.db.Where("org_id = ? AND (year < ? OR (year = ? AND month < ?))", s.orgID, p.Year, p.Year, p.Month).
+		Order("year DESC, month DESC").First(&prev).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &prev, nil
+}
+
+// RecentPeriods returns up to n periods ending at (and including) upTo, oldest first.
+func (s *Service) RecentPeriods(upTo *models.SurveyPeriod, n int) ([]models.SurveyPeriod, error) {
+	var periods []models.SurveyPeriod
+	err := s.db.Where("org_id = ? AND (year < ? OR (year = ? AND month <= ?))", s.orgID, upTo.Year, upTo.Year, upTo.Month).
+		Order("year DESC, month DESC").Limit(n).Find(&periods).Error
+	if err != nil {
+		return nil, err
+	}
+	for i, j := 0, len(periods)-1; i < j; i, j = i+1, j-1 {
+		periods[i], periods[j] = periods[j], periods[i]
+	}
+	return periods, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -37,14 +110,14 @@ func previousPeriod(period string) string {
 // RespondentCounts returns respondents per department for a period. Departments below the
 // threshold are still counted here (the caller needs the count to decide suppression) but
 // their *scores* are never selected — see DepartmentTopicScores.
-func (s *Service) RespondentCounts(period string) (map[string]int64, error) {
+func (s *Service) RespondentCounts(periodID string) (map[string]int64, error) {
 	var rows []struct {
 		DepartmentID string
 		N            int64
 	}
 	err := s.db.Model(&models.SurveyResponse{}).
 		Select("department_id, COUNT(*) AS n").
-		Where("period_month = ?", period).
+		Where("period_id = ? AND department_id IS NOT NULL", periodID).
 		Group("department_id").
 		Scan(&rows).Error
 	if err != nil {
@@ -58,9 +131,9 @@ func (s *Service) RespondentCounts(period string) (map[string]int64, error) {
 }
 
 // TotalRespondents counts submissions for the period across the whole company.
-func (s *Service) TotalRespondents(period string) (int64, error) {
+func (s *Service) TotalRespondents(periodID string) (int64, error) {
 	var n int64
-	err := s.db.Model(&models.SurveyResponse{}).Where("period_month = ?", period).Count(&n).Error
+	err := s.db.Model(&models.SurveyResponse{}).Where("period_id = ?", periodID).Count(&n).Error
 	return n, err
 }
 
@@ -75,20 +148,20 @@ type ENPSResult struct {
 	Total      int64
 }
 
-// ENPS = %promoters (9–10) − %detractors (0–6), the standard formula.
-func (s *Service) ENPS(period string) (ENPSResult, error) {
+// ENPS is an approximation derived from the satisfaction_score distribution (there is no
+// dedicated 0-10 recommend question in the fixed survey model): score 5 counts as a
+// promoter, score <=3 as a detractor, using the standard %promoters-%detractors formula.
+func (s *Service) ENPS(periodID string) (ENPSResult, error) {
 	var row struct {
 		Promoters  int64
 		Detractors int64
 		Total      int64
 	}
-	err := s.db.Model(&models.ResponseAnswer{}).
-		Joins("JOIN survey_responses ON survey_responses.id = response_answers.response_id").
-		Joins("JOIN survey_questions ON survey_questions.id = response_answers.question_id").
-		Where("survey_questions.type = ? AND survey_responses.period_month = ?", models.QuestionENPS, period).
+	err := s.db.Model(&models.SurveyResponse{}).
+		Where("period_id = ?", periodID).
 		Select(`
-			COUNT(*) FILTER (WHERE response_answers.numeric_value >= 9) AS promoters,
-			COUNT(*) FILTER (WHERE response_answers.numeric_value <= 6) AS detractors,
+			COUNT(*) FILTER (WHERE satisfaction_score = 5) AS promoters,
+			COUNT(*) FILTER (WHERE satisfaction_score <= 3) AS detractors,
 			COUNT(*) AS total`).
 		Scan(&row).Error
 	if err != nil || row.Total == 0 {
@@ -103,14 +176,12 @@ func (s *Service) ENPS(period string) (ENPSResult, error) {
 	}, nil
 }
 
-// SatisfactionAverage is the mean of every scale5 answer in the period.
-func (s *Service) SatisfactionAverage(period string) (float64, error) {
+// SatisfactionAverage is the mean satisfaction_score across all responses in the period.
+func (s *Service) SatisfactionAverage(periodID string) (float64, error) {
 	var avg *float64
-	err := s.db.Model(&models.ResponseAnswer{}).
-		Joins("JOIN survey_responses ON survey_responses.id = response_answers.response_id").
-		Joins("JOIN survey_questions ON survey_questions.id = response_answers.question_id").
-		Where("survey_questions.type = ? AND survey_responses.period_month = ?", models.QuestionScale5, period).
-		Select("AVG(response_answers.numeric_value)").
+	err := s.db.Model(&models.SurveyResponse{}).
+		Where("period_id = ?", periodID).
+		Select("AVG(satisfaction_score)").
 		Scan(&avg).Error
 	if err != nil || avg == nil {
 		return 0, err
@@ -118,21 +189,23 @@ func (s *Service) SatisfactionAverage(period string) (float64, error) {
 	return round(*avg, 2), nil
 }
 
-// SentimentSplit is the positive/neutral/negative percentage over classified open text.
-func (s *Service) SentimentSplit(period string) (models.SentimentSplit, error) {
+// SentimentSplit is the positive/neutral/negative percentage over responses that have a
+// comment (and therefore a response_analysis row). Enum values are the schema's
+// pos/neu/neg — translated to the frontend's positive/neutral/negative wording in dto.
+func (s *Service) SentimentSplit(periodID string) (models.SentimentSplit, error) {
 	var row struct {
 		Positive int64
 		Neutral  int64
 		Negative int64
 		Total    int64
 	}
-	err := s.db.Model(&models.ResponseAnswer{}).
-		Joins("JOIN survey_responses ON survey_responses.id = response_answers.response_id").
-		Where("survey_responses.period_month = ? AND response_answers.sentiment <> ''", period).
+	err := s.db.Model(&models.ResponseAnalysis{}).
+		Joins("JOIN survey_responses ON survey_responses.id = response_analysis.response_id").
+		Where("survey_responses.period_id = ?", periodID).
 		Select(`
-			COUNT(*) FILTER (WHERE response_answers.sentiment = 'positive') AS positive,
-			COUNT(*) FILTER (WHERE response_answers.sentiment = 'neutral')  AS neutral,
-			COUNT(*) FILTER (WHERE response_answers.sentiment = 'negative') AS negative,
+			COUNT(*) FILTER (WHERE response_analysis.sentiment_label = 'pos') AS positive,
+			COUNT(*) FILTER (WHERE response_analysis.sentiment_label = 'neu') AS neutral,
+			COUNT(*) FILTER (WHERE response_analysis.sentiment_label = 'neg') AS negative,
 			COUNT(*) AS total`).
 		Scan(&row).Error
 	if err != nil || row.Total == 0 {
@@ -151,21 +224,20 @@ func (s *Service) SentimentSplit(period string) (models.SentimentSplit, error) {
 	return split, nil
 }
 
-// BurnoutRisk is the share of respondents whose workload-topic scores sit at 2 or below,
-// plus how many departments are above the alert line.
+// BurnoutRisk is the share of respondents scoring 2 or below, plus how many departments are
+// above the alert line.
 // ponytail: threshold heuristic, not a validated model — the formula was still open in the
 // spec. Swap this one function when the real definition lands.
-func (s *Service) BurnoutRisk(period string) (percentage int, departmentsAtRisk int, err error) {
+func (s *Service) BurnoutRisk(periodID string) (percentage int, departmentsAtRisk int, err error) {
 	var row struct {
 		AtRisk int64
 		Total  int64
 	}
 	err = s.db.Model(&models.SurveyResponse{}).
-		Joins("JOIN response_answers ON response_answers.response_id = survey_responses.id").
-		Where("survey_responses.period_month = ? AND response_answers.topic_id = ? AND response_answers.numeric_value IS NOT NULL", period, "work").
+		Where("period_id = ?", periodID).
 		Select(`
-			COUNT(DISTINCT survey_responses.id) FILTER (WHERE response_answers.numeric_value <= 2) AS at_risk,
-			COUNT(DISTINCT survey_responses.id) AS total`).
+			COUNT(*) FILTER (WHERE satisfaction_score <= 2) AS at_risk,
+			COUNT(*) AS total`).
 		Scan(&row).Error
 	if err != nil || row.Total == 0 {
 		return 0, 0, err
@@ -173,12 +245,11 @@ func (s *Service) BurnoutRisk(period string) (percentage int, departmentsAtRisk 
 
 	var deptRows []struct{ DepartmentID string }
 	err = s.db.Model(&models.SurveyResponse{}).
-		Joins("JOIN response_answers ON response_answers.response_id = survey_responses.id").
-		Where("survey_responses.period_month = ? AND response_answers.topic_id = ? AND response_answers.numeric_value IS NOT NULL", period, "work").
-		Group("survey_responses.department_id").
+		Where("period_id = ? AND department_id IS NOT NULL", periodID).
+		Group("department_id").
 		// n<5: a department too small to report is also too small to name as at-risk.
-		Having("COUNT(DISTINCT survey_responses.id) >= ? AND AVG(response_answers.numeric_value) < ?", privacy.MinGroupSizeSQL, 3.0).
-		Select("survey_responses.department_id AS department_id").
+		Having("COUNT(*) >= ? AND AVG(satisfaction_score) < ?", privacy.MinGroupSizeSQL, 3.0).
+		Select("department_id").
 		Scan(&deptRows).Error
 	if err != nil {
 		return 0, 0, err
@@ -193,30 +264,29 @@ type TrendPoint struct {
 	Satisfaction float64 `json:"satisfaction"`
 }
 
-// Trend returns the last `months` periods ending at `period`, oldest first.
-func (s *Service) Trend(period string, months int) ([]TrendPoint, error) {
-	end, err := time.Parse("2006-01", period)
+// Trend returns up to `months` periods ending at `upTo`, oldest first.
+func (s *Service) Trend(upTo *models.SurveyPeriod, months int) ([]TrendPoint, error) {
+	periods, err := s.RecentPeriods(upTo, months)
 	if err != nil {
 		return nil, err
 	}
-	points := make([]TrendPoint, 0, months)
-	for i := months - 1; i >= 0; i-- {
-		p := end.AddDate(0, -i, 0).Format("2006-01")
-		enps, err := s.ENPS(p)
+	points := make([]TrendPoint, 0, len(periods))
+	for _, p := range periods {
+		enps, err := s.ENPS(p.ID)
 		if err != nil {
 			return nil, err
 		}
-		sat, err := s.SatisfactionAverage(p)
+		sat, err := s.SatisfactionAverage(p.ID)
 		if err != nil {
 			return nil, err
 		}
-		points = append(points, TrendPoint{Month: p, ENPS: enps.Value, Satisfaction: sat})
+		points = append(points, TrendPoint{Month: periodLabel(p), ENPS: enps.Value, Satisfaction: sat})
 	}
 	return points, nil
 }
 
 // ---------------------------------------------------------------------------
-// Heatmap — department × topic
+// Heatmap — department × topic (topic membership from response_analysis.categories)
 // ---------------------------------------------------------------------------
 
 type DeptTopicScore struct {
@@ -226,43 +296,62 @@ type DeptTopicScore struct {
 	Respondents  int64
 }
 
-// DepartmentTopicScores returns only cells whose department cleared the n<5 threshold.
-// The HAVING clause is the load-bearing part: scores for a small department are never
-// selected, so there is no in-memory copy to accidentally serialize later.
-func (s *Service) DepartmentTopicScores(period string) ([]DeptTopicScore, error) {
-	var rows []DeptTopicScore
-	err := s.db.Model(&models.SurveyResponse{}).
-		Joins("JOIN response_answers ON response_answers.response_id = survey_responses.id").
-		Where("survey_responses.period_month = ? AND response_answers.numeric_value IS NOT NULL AND response_answers.topic_id <> ''", period).
-		Group("survey_responses.department_id, response_answers.topic_id").
-		Having("COUNT(DISTINCT survey_responses.id) >= ?", privacy.MinGroupSizeSQL).
-		Select(`
-			survey_responses.department_id AS department_id,
-			response_answers.topic_id AS topic_id,
-			ROUND(AVG(response_answers.numeric_value)::numeric, 1)::float8 AS score,
-			COUNT(DISTINCT survey_responses.id) AS respondents`).
-		Scan(&rows).Error
-	return rows, err
+// DepartmentTopicScores returns only cells whose department cleared the n<5 threshold. Runs
+// one query per topic (small, fixed-size taxonomy) using jsonb containment on
+// response_analysis.categories, the same cast-at-query-time pattern as FeedPost.Hashtags.
+func (s *Service) DepartmentTopicScores(periodID string, topics []models.Topic) ([]DeptTopicScore, error) {
+	out := make([]DeptTopicScore, 0, len(topics)*4)
+	for _, topic := range topics {
+		containsTopic, err := json.Marshal([]string{topic.ID})
+		if err != nil {
+			return nil, err
+		}
+		var rows []struct {
+			DepartmentID string
+			Score        float64
+			Respondents  int64
+		}
+		err = s.db.Model(&models.SurveyResponse{}).
+			Joins("JOIN response_analysis ON response_analysis.response_id = survey_responses.id").
+			Where("survey_responses.period_id = ? AND survey_responses.department_id IS NOT NULL AND response_analysis.categories::jsonb @> ?::jsonb", periodID, string(containsTopic)).
+			Group("survey_responses.department_id").
+			Having("COUNT(DISTINCT survey_responses.id) >= ?", privacy.MinGroupSizeSQL).
+			Select(`
+				survey_responses.department_id AS department_id,
+				ROUND(AVG(survey_responses.satisfaction_score)::numeric, 1)::float8 AS score,
+				COUNT(DISTINCT survey_responses.id) AS respondents`).
+			Scan(&rows).Error
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range rows {
+			out = append(out, DeptTopicScore{DepartmentID: r.DepartmentID, TopicID: topic.ID, Score: r.Score, Respondents: r.Respondents})
+		}
+	}
+	return out, nil
 }
 
-// TopicAverages returns the company-wide average per topic for a period.
-func (s *Service) TopicAverages(period string) (map[string]float64, error) {
-	var rows []struct {
-		TopicID string
-		Score   float64
-	}
-	err := s.db.Model(&models.ResponseAnswer{}).
-		Joins("JOIN survey_responses ON survey_responses.id = response_answers.response_id").
-		Where("survey_responses.period_month = ? AND response_answers.numeric_value IS NOT NULL AND response_answers.topic_id <> ''", period).
-		Group("response_answers.topic_id").
-		Select("response_answers.topic_id AS topic_id, ROUND(AVG(response_answers.numeric_value)::numeric, 2)::float8 AS score").
-		Scan(&rows).Error
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[string]float64, len(rows))
-	for _, r := range rows {
-		out[r.TopicID] = r.Score
+// TopicAverages returns the company-wide average per topic for a period (no suppression —
+// this is an aggregate over the whole company, not a small group).
+func (s *Service) TopicAverages(periodID string, topics []models.Topic) (map[string]float64, error) {
+	out := make(map[string]float64, len(topics))
+	for _, topic := range topics {
+		containsTopic, err := json.Marshal([]string{topic.ID})
+		if err != nil {
+			return nil, err
+		}
+		var avg *float64
+		err = s.db.Model(&models.SurveyResponse{}).
+			Joins("JOIN response_analysis ON response_analysis.response_id = survey_responses.id").
+			Where("survey_responses.period_id = ? AND response_analysis.categories::jsonb @> ?::jsonb", periodID, string(containsTopic)).
+			Select("ROUND(AVG(survey_responses.satisfaction_score)::numeric, 2)::float8").
+			Scan(&avg).Error
+		if err != nil {
+			return nil, err
+		}
+		if avg != nil {
+			out[topic.ID] = *avg
+		}
 	}
 	return out, nil
 }
@@ -277,14 +366,21 @@ type RadarAxis struct {
 	LastMonth float64 `json:"lastMonth"`
 }
 
-func (s *Service) Radar(period string, topics []models.Topic) ([]RadarAxis, error) {
-	current, err := s.TopicAverages(period)
+func (s *Service) Radar(period *models.SurveyPeriod, topics []models.Topic) ([]RadarAxis, error) {
+	current, err := s.TopicAverages(period.ID, topics)
 	if err != nil {
 		return nil, err
 	}
-	previous, err := s.TopicAverages(previousPeriod(period))
+	prevPeriod, err := s.PreviousPeriod(period)
 	if err != nil {
 		return nil, err
+	}
+	previous := map[string]float64{}
+	if prevPeriod != nil {
+		previous, err = s.TopicAverages(prevPeriod.ID, topics)
+		if err != nil {
+			return nil, err
+		}
 	}
 	axes := make([]RadarAxis, 0, len(topics))
 	for _, t := range topics {
@@ -293,22 +389,24 @@ func (s *Service) Radar(period string, topics []models.Topic) ([]RadarAxis, erro
 	return axes, nil
 }
 
-// DepartmentAverages returns each department's overall score, suppressed below n<5.
-// Executives receive these as visual bars only; the suppressed shape keeps a small
+type DepartmentScore struct {
+	DepartmentID string                        `json:"departmentId"`
+	Score        models.Suppressible[float64] `json:"score"`
+}
+
+// DepartmentAverages returns each department's overall satisfaction score, suppressed below
+// n<5. Executives receive these as visual bars only; the suppressed shape keeps a small
 // department out of the payload entirely rather than sending a number the UI must hide.
-func (s *Service) DepartmentAverages(period string, departments []models.Department) ([]DepartmentScore, error) {
+func (s *Service) DepartmentAverages(periodID string, departments []models.Department) ([]DepartmentScore, error) {
 	var rows []struct {
 		DepartmentID string
 		Score        float64
 	}
 	err := s.db.Model(&models.SurveyResponse{}).
-		Joins("JOIN response_answers ON response_answers.response_id = survey_responses.id").
-		Where("survey_responses.period_month = ? AND response_answers.numeric_value IS NOT NULL AND response_answers.topic_id <> ''", period).
-		Group("survey_responses.department_id").
-		Having("COUNT(DISTINCT survey_responses.id) >= ?", privacy.MinGroupSizeSQL).
-		Select(`
-			survey_responses.department_id AS department_id,
-			ROUND(AVG(response_answers.numeric_value)::numeric, 1)::float8 AS score`).
+		Where("period_id = ? AND department_id IS NOT NULL", periodID).
+		Group("department_id").
+		Having("COUNT(*) >= ?", privacy.MinGroupSizeSQL).
+		Select("department_id, ROUND(AVG(satisfaction_score)::numeric, 1)::float8 AS score").
 		Scan(&rows).Error
 	if err != nil {
 		return nil, err
@@ -318,7 +416,7 @@ func (s *Service) DepartmentAverages(period string, departments []models.Departm
 		byDept[r.DepartmentID] = r.Score
 	}
 
-	counts, err := s.RespondentCounts(period)
+	counts, err := s.RespondentCounts(periodID)
 	if err != nil {
 		return nil, err
 	}
@@ -338,42 +436,54 @@ func (s *Service) DepartmentAverages(period string, departments []models.Departm
 	return out, nil
 }
 
-type DepartmentScore struct {
-	DepartmentID string                      `json:"departmentId"`
-	Score        models.Suppressible[float64] `json:"score"`
+type PositionScore struct {
+	PositionID string
+	Score      float64
 }
 
-type TenureScore struct {
-	Bucket string  `json:"bucket"`
-	Score  float64 `json:"score"`
-}
-
-// TenureAverages groups by tenure band, again gated by the n<5 threshold in SQL.
-func (s *Service) TenureAverages(period string) ([]TenureScore, error) {
-	var rows []TenureScore
+// PositionAverages groups by position (this app's replacement for the old tenure-bucket
+// breakdown, since the fixed schema tracks position instead of tenure), gated by n<5.
+// Positions below the threshold are simply omitted from the result — the executive chart
+// renders fewer bars rather than a suppressed placeholder, matching how this chart behaved
+// for tenure before.
+func (s *Service) PositionAverages(periodID string, positions []models.Position) ([]PositionScore, error) {
+	var rows []struct {
+		PositionID string
+		Score      float64
+	}
 	err := s.db.Model(&models.SurveyResponse{}).
-		Joins("JOIN response_answers ON response_answers.response_id = survey_responses.id").
-		Where("survey_responses.period_month = ? AND response_answers.numeric_value IS NOT NULL AND response_answers.topic_id <> ''", period).
-		Group("survey_responses.tenure_bucket").
-		Having("COUNT(DISTINCT survey_responses.id) >= ?", privacy.MinGroupSizeSQL).
-		Select(`
-			survey_responses.tenure_bucket AS bucket,
-			ROUND(AVG(response_answers.numeric_value)::numeric, 1)::float8 AS score`).
-		Order("bucket").
+		Where("period_id = ? AND position_id IS NOT NULL", periodID).
+		Group("position_id").
+		Having("COUNT(*) >= ?", privacy.MinGroupSizeSQL).
+		Select("position_id, ROUND(AVG(satisfaction_score)::numeric, 1)::float8 AS score").
 		Scan(&rows).Error
-	return rows, err
+	if err != nil {
+		return nil, err
+	}
+	byPosition := make(map[string]float64, len(rows))
+	for _, r := range rows {
+		byPosition[r.PositionID] = r.Score
+	}
+
+	out := make([]PositionScore, 0, len(positions))
+	for _, p := range positions {
+		if score, ok := byPosition[p.ID]; ok {
+			out = append(out, PositionScore{PositionID: p.ID, Score: score})
+		}
+	}
+	return out, nil
 }
 
-// OverallHealthScore condenses satisfaction and sentiment into the 0–100 figure the
+// OverallHealthScore condenses satisfaction and sentiment into the 0-100 figure the
 // executive card shows.
 // ponytail: weighted blend (70% satisfaction, 30% net sentiment); replace when the real
 // scoring model is agreed.
-func (s *Service) OverallHealthScore(period string) (int, error) {
-	sat, err := s.SatisfactionAverage(period)
+func (s *Service) OverallHealthScore(periodID string) (int, error) {
+	sat, err := s.SatisfactionAverage(periodID)
 	if err != nil {
 		return 0, err
 	}
-	sentiment, err := s.SentimentSplit(period)
+	sentiment, err := s.SentimentSplit(periodID)
 	if err != nil {
 		return 0, err
 	}
@@ -387,37 +497,41 @@ func (s *Service) OverallHealthScore(period string) (int, error) {
 // ---------------------------------------------------------------------------
 
 type TopicStats struct {
-	Score           float64
-	CompanyAverage  float64
-	RespondentCount int64
-	PercentageTagged int
+	Score             float64
+	CompanyAverage    float64
+	RespondentCount   int64
+	PercentageTagged  int
 }
 
-func (s *Service) TopicStats(period, topicID string) (TopicStats, error) {
+func (s *Service) TopicStats(periodID, topicID string) (TopicStats, error) {
+	containsTopic, err := json.Marshal([]string{topicID})
+	if err != nil {
+		return TopicStats{}, err
+	}
+
 	var row struct {
 		Score       *float64
 		Respondents int64
 	}
-	err := s.db.Model(&models.ResponseAnswer{}).
-		Joins("JOIN survey_responses ON survey_responses.id = response_answers.response_id").
-		Where("survey_responses.period_month = ? AND response_answers.topic_id = ? AND response_answers.numeric_value IS NOT NULL", period, topicID).
-		Select("AVG(response_answers.numeric_value) AS score, COUNT(DISTINCT survey_responses.id) AS respondents").
+	err = s.db.Model(&models.SurveyResponse{}).
+		Joins("JOIN response_analysis ON response_analysis.response_id = survey_responses.id").
+		Where("survey_responses.period_id = ? AND response_analysis.categories::jsonb @> ?::jsonb", periodID, string(containsTopic)).
+		Select("AVG(survey_responses.satisfaction_score) AS score, COUNT(DISTINCT survey_responses.id) AS respondents").
 		Scan(&row).Error
 	if err != nil {
 		return TopicStats{}, err
 	}
 
 	var companyAvg *float64
-	err = s.db.Model(&models.ResponseAnswer{}).
-		Joins("JOIN survey_responses ON survey_responses.id = response_answers.response_id").
-		Where("survey_responses.period_month = ? AND response_answers.numeric_value IS NOT NULL AND response_answers.topic_id <> ''", period).
-		Select("AVG(response_answers.numeric_value)").
+	err = s.db.Model(&models.SurveyResponse{}).
+		Where("period_id = ?", periodID).
+		Select("AVG(satisfaction_score)").
 		Scan(&companyAvg).Error
 	if err != nil {
 		return TopicStats{}, err
 	}
 
-	total, err := s.TotalRespondents(period)
+	total, err := s.TotalRespondents(periodID)
 	if err != nil {
 		return TopicStats{}, err
 	}
@@ -440,24 +554,28 @@ type TopicTrendPoint struct {
 	Score float64 `json:"score"`
 }
 
-func (s *Service) TopicTrend(period, topicID string, months int) ([]TopicTrendPoint, error) {
-	end, err := time.Parse("2006-01", period)
+func (s *Service) TopicTrend(upTo *models.SurveyPeriod, topicID string, months int) ([]TopicTrendPoint, error) {
+	periods, err := s.RecentPeriods(upTo, months)
 	if err != nil {
 		return nil, err
 	}
-	points := make([]TopicTrendPoint, 0, months)
-	for i := months - 1; i >= 0; i-- {
-		p := end.AddDate(0, -i, 0).Format("2006-01")
+	containsTopic, err := json.Marshal([]string{topicID})
+	if err != nil {
+		return nil, err
+	}
+
+	points := make([]TopicTrendPoint, 0, len(periods))
+	for _, p := range periods {
 		var avg *float64
-		err := s.db.Model(&models.ResponseAnswer{}).
-			Joins("JOIN survey_responses ON survey_responses.id = response_answers.response_id").
-			Where("survey_responses.period_month = ? AND response_answers.topic_id = ? AND response_answers.numeric_value IS NOT NULL", p, topicID).
-			Select("AVG(response_answers.numeric_value)").
+		err := s.db.Model(&models.SurveyResponse{}).
+			Joins("JOIN response_analysis ON response_analysis.response_id = survey_responses.id").
+			Where("survey_responses.period_id = ? AND response_analysis.categories::jsonb @> ?::jsonb", p.ID, string(containsTopic)).
+			Select("AVG(survey_responses.satisfaction_score)").
 			Scan(&avg).Error
 		if err != nil {
 			return nil, err
 		}
-		point := TopicTrendPoint{Month: p}
+		point := TopicTrendPoint{Month: periodLabel(p)}
 		if avg != nil {
 			point.Score = round(*avg, 2)
 		}

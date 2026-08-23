@@ -17,10 +17,11 @@ import (
 type AuthHandler struct {
 	db     *gorm.DB
 	issuer *auth.Issuer
+	orgID  string
 }
 
-func NewAuthHandler(db *gorm.DB, issuer *auth.Issuer) *AuthHandler {
-	return &AuthHandler{db: db, issuer: issuer}
+func NewAuthHandler(db *gorm.DB, issuer *auth.Issuer, orgID string) *AuthHandler {
+	return &AuthHandler{db: db, issuer: issuer, orgID: orgID}
 }
 
 // Login verifies credentials and mints the token pair. The role comes from the database
@@ -37,7 +38,7 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 	}
 
 	var user models.User
-	err := h.db.Where("email = ?", req.Email).First(&user).Error
+	err := h.db.Where("org_id = ? AND email = ?", h.orgID, req.Email).First(&user).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		// Same message and roughly the same work either way, so the response cannot be
 		// used to discover which addresses have accounts.
@@ -46,6 +47,9 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 	}
 	if err != nil {
 		return err
+	}
+	if !user.IsActive {
+		return fiber.NewError(fiber.StatusUnauthorized, "invalid email or password")
 	}
 
 	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)) != nil {
@@ -127,20 +131,37 @@ func (h *AuthHandler) issuePair(c *fiber.Ctx, user *models.User) error {
 		return err
 	}
 
+	deptName := h.departmentName(user.DepartmentID)
+	posName := h.positionName(user.PositionID)
+
 	return c.JSON(dto.AuthResponse{
 		AccessToken:  access,
 		RefreshToken: refresh,
 		ExpiresAt:    expiresAt,
-		User:         dto.NewUser(user, h.departmentName(user.DepartmentID)),
+		User:         dto.NewUser(user, deptName, posName),
 	})
 }
 
-func (h *AuthHandler) departmentName(departmentID string) string {
-	var department models.Department
-	if h.db.First(&department, "id = ?", departmentID).Error != nil {
+func (h *AuthHandler) departmentName(departmentID *string) string {
+	if departmentID == nil {
 		return ""
 	}
-	return department.Name.TH
+	var department models.Department
+	if h.db.First(&department, "id = ?", *departmentID).Error != nil {
+		return ""
+	}
+	return department.Name
+}
+
+func (h *AuthHandler) positionName(positionID *string) string {
+	if positionID == nil {
+		return ""
+	}
+	var position models.Position
+	if h.db.First(&position, "id = ?", *positionID).Error != nil {
+		return ""
+	}
+	return position.Name
 }
 
 // Me returns the signed-in user for the settings screen.
@@ -149,7 +170,7 @@ func (h *AuthHandler) Me(c *fiber.Ctx) error {
 	if err := h.db.First(&user, "id = ?", middleware.UserID(c)).Error; err != nil {
 		return fiber.NewError(fiber.StatusNotFound, "user not found")
 	}
-	return c.JSON(dto.NewUser(&user, h.departmentName(user.DepartmentID)))
+	return c.JSON(dto.NewUser(&user, h.departmentName(user.DepartmentID), h.positionName(user.PositionID)))
 }
 
 // UpdateMe changes the caller's own notification preferences and nothing else.
@@ -171,13 +192,19 @@ func (h *AuthHandler) UpdateMe(c *fiber.Ctx) error {
 	return h.Me(c)
 }
 
-// SubmissionHistory reports only whether the caller submitted each survey, never what they
-// answered. It reads audit_submission_log, which shares no key with survey_responses.
+// SubmissionHistory reports only whether the caller submitted each survey period, never what
+// they answered. It reads survey_submissions, which shares no key with survey_responses.
 func (h *AuthHandler) SubmissionHistory(c *fiber.Ctx) error {
-	var entries []models.AuditSubmissionLog
-	err := h.db.Where("user_id = ?", middleware.UserID(c)).Order("survey_id").Find(&entries).Error
+	var periods []models.SurveyPeriod
+	if err := h.db.Where("org_id = ?", h.orgID).Order("year DESC, month DESC").Find(&periods).Error; err != nil {
+		return err
+	}
+
+	var submissions []models.SurveySubmission
+	err := h.db.Where("user_id = ?", middleware.UserID(c)).Find(&submissions).Error
 	if err != nil {
 		return err
 	}
-	return c.JSON(dto.NewSubmissionLog(entries))
+
+	return c.JSON(dto.NewSubmissionHistory(periods, submissions))
 }

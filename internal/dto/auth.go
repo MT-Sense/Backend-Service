@@ -54,31 +54,30 @@ func (r *UpdateSettingsRequest) Updates() map[string]any {
 
 // --- responses ---
 
-// User mirrors the frontend's CurrentUser. PasswordHash and the raw DepartmentID have no
-// field here at all, so they cannot leak regardless of what the model gains later.
+// User mirrors the frontend's CurrentUser. PasswordHash and the raw department/position ids
+// have no field here at all, so they cannot leak regardless of what the model gains later.
 type User struct {
 	ID                   string    `json:"id"`
 	Email                string    `json:"email"`
 	FullName             string    `json:"fullName"`
 	Role                 string    `json:"role"`
 	Department           string    `json:"department"`
+	Position             string    `json:"position"`
 	LastLoginAt          time.Time `json:"lastLoginAt"`
 	NotifyNewRound       bool      `json:"notifyNewRound"`
 	NotifyMonthlySummary bool      `json:"notifyMonthlySummary"`
 }
 
-// NewUser builds the DTO. departmentName is resolved by the caller, which already has the
-// department loaded; passing "" falls back to the raw id.
-func NewUser(u *models.User, departmentName string) User {
-	if departmentName == "" {
-		departmentName = u.DepartmentID
-	}
+// NewUser builds the DTO. departmentName/positionName are resolved by the caller, which
+// already has the rows loaded.
+func NewUser(u *models.User, departmentName, positionName string) User {
 	return User{
 		ID:                   u.ID,
 		Email:                u.Email,
 		FullName:             u.FullName,
 		Role:                 string(u.Role),
 		Department:           departmentName,
+		Position:             positionName,
 		LastLoginAt:          u.LastLoginAt,
 		NotifyNewRound:       u.NotifyNewRound,
 		NotifyMonthlySummary: u.NotifyMonthlySummary,
@@ -92,23 +91,38 @@ type AuthResponse struct {
 	User         User      `json:"user"`
 }
 
-// SubmissionLogEntry mirrors AuditSubmissionLogEntry: whether a survey was submitted, and
-// nothing whatsoever about what was answered.
-type SubmissionLogEntry struct {
-	UserID      string     `json:"userId"`
-	SurveyID    string     `json:"surveyId"`
-	Status      string     `json:"status"`
+// PeriodSubmissionStatus reports, per survey period, only whether the caller submitted —
+// never what they answered. It is built from SurveySubmission, which shares no key with
+// SurveyResponse.
+type PeriodSubmissionStatus struct {
+	PeriodID    string     `json:"periodId"`
+	Month       int        `json:"month"`
+	Year        int        `json:"year"`
+	Status      string     `json:"status"` // submitted | not_submitted
 	SubmittedAt *time.Time `json:"submittedAt"`
 }
 
-func NewSubmissionLog(entries []models.AuditSubmissionLog) []SubmissionLogEntry {
-	out := make([]SubmissionLogEntry, 0, len(entries))
-	for _, e := range entries {
-		out = append(out, SubmissionLogEntry{
-			UserID:      e.UserID,
-			SurveyID:    e.SurveyID,
-			Status:      e.Status,
-			SubmittedAt: e.SubmittedAt,
+func NewSubmissionHistory(periods []models.SurveyPeriod, submissions []models.SurveySubmission) []PeriodSubmissionStatus {
+	byPeriod := make(map[string]time.Time, len(submissions))
+	for _, s := range submissions {
+		byPeriod[s.PeriodID] = s.SubmittedAt
+	}
+
+	out := make([]PeriodSubmissionStatus, 0, len(periods))
+	for _, p := range periods {
+		status := "not_submitted"
+		var submittedAt *time.Time
+		if t, ok := byPeriod[p.ID]; ok {
+			status = "submitted"
+			tCopy := t
+			submittedAt = &tCopy
+		}
+		out = append(out, PeriodSubmissionStatus{
+			PeriodID:    p.ID,
+			Month:       int(p.Month),
+			Year:        int(p.Year),
+			Status:      status,
+			SubmittedAt: submittedAt,
 		})
 	}
 	return out

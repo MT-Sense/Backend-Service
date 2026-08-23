@@ -1,109 +1,89 @@
 package dto
 
 import (
-	"encoding/json"
 	"time"
 
 	"github.com/mt-sense/backend-service/internal/models"
 )
 
-// --- responses ---
-
-type SurveyQuestion struct {
-	ID             string      `json:"id"`
-	Type           string      `json:"type"`
-	Text           Localized   `json:"text"`
-	Required       bool        `json:"required"`
-	MetricMapping  string      `json:"metricMapping,omitempty"`
-	SendToAI       bool        `json:"sendToAi,omitempty"`
-	Options        []Localized `json:"options,omitempty"`
-	TagSuggestions []string    `json:"tagSuggestions,omitempty"`
-	AllowPublish   bool        `json:"allowPublishOptIn,omitempty"`
+// SurveyPeriod is a monthly survey window. Under the fixed-question model there is no
+// authored "form" to fetch — the client just needs to know which period is open and
+// whether the caller already submitted it.
+type SurveyPeriod struct {
+	ID               string    `json:"id"`
+	Month            int       `json:"month"`
+	Year             int       `json:"year"`
+	OpensAt          time.Time `json:"opensAt"`
+	ClosesAt         time.Time `json:"closesAt"`
+	IsOpen           bool      `json:"isOpen"`
+	AlreadySubmitted bool      `json:"alreadySubmitted"`
+	ResponseCount    int64     `json:"responseCount"`
 }
 
-type SurveyStep struct {
-	ID               string           `json:"id"`
-	Title            Localized        `json:"title"`
-	EstimatedMinutes int              `json:"estimatedMinutes"`
-	Questions        []SurveyQuestion `json:"questions"`
-}
-
-type Survey struct {
-	ID            string       `json:"id"`
-	Title         Localized    `json:"title"`
-	Cadence       string       `json:"cadence"`
-	NextRoundDate string       `json:"nextRoundDate"`
-	Status        string       `json:"status"`
-	Steps         []SurveyStep `json:"steps"`
-}
-
-// NewSurvey maps the loaded tree. TopicID stays out of the payload deliberately — it is an
-// internal analysis mapping, not something the survey form needs.
-func NewSurvey(s *models.Survey) Survey {
-	out := Survey{
-		ID:            s.ID,
-		Title:         s.Title,
-		Cadence:       s.Cadence,
-		NextRoundDate: s.NextRoundDate,
-		Status:        s.Status,
-		Steps:         make([]SurveyStep, 0, len(s.Steps)),
+func NewSurveyPeriod(p *models.SurveyPeriod, alreadySubmitted bool, responseCount int64) SurveyPeriod {
+	now := time.Now()
+	return SurveyPeriod{
+		ID:               p.ID,
+		Month:            int(p.Month),
+		Year:             int(p.Year),
+		OpensAt:          p.OpensAt,
+		ClosesAt:         p.ClosesAt,
+		IsOpen:           !now.Before(p.OpensAt) && now.Before(p.ClosesAt),
+		AlreadySubmitted: alreadySubmitted,
+		ResponseCount:    responseCount,
 	}
-	for _, step := range s.Steps {
-		dtoStep := SurveyStep{
-			ID:               step.ID,
-			Title:            step.Title,
-			EstimatedMinutes: step.EstimatedMinutes,
-			Questions:        make([]SurveyQuestion, 0, len(step.Questions)),
-		}
-		for _, q := range step.Questions {
-			dtoStep.Questions = append(dtoStep.Questions, SurveyQuestion{
-				ID:             q.ID,
-				Type:           string(q.Type),
-				Text:           q.Text,
-				Required:       q.Required,
-				MetricMapping:  q.MetricMapping,
-				SendToAI:       q.SendToAI,
-				Options:        q.Options,
-				TagSuggestions: q.TagSuggestions,
-				AllowPublish:   q.AllowPublish,
-			})
-		}
-		out.Steps = append(out.Steps, dtoStep)
+}
+
+func NewSurveyPeriodList(periods []models.SurveyPeriod, counts map[string]int64) []SurveyPeriod {
+	out := make([]SurveyPeriod, 0, len(periods))
+	for i := range periods {
+		out = append(out, NewSurveyPeriod(&periods[i], false, counts[periods[i].ID]))
 	}
 	return out
 }
 
-func NewSurveyList(surveys []models.Survey) []Survey {
-	out := make([]Survey, 0, len(surveys))
-	for i := range surveys {
-		out = append(out, NewSurvey(&surveys[i]))
+// CreatePeriodRequest opens the next monthly round. ClosesAt defaults to one calendar month
+// after OpensAt when omitted (set by the handler, not here).
+type CreatePeriodRequest struct {
+	Month    int        `json:"month"`
+	Year     int        `json:"year"`
+	OpensAt  *time.Time `json:"opensAt"`
+	ClosesAt *time.Time `json:"closesAt"`
+}
+
+func (r *CreatePeriodRequest) Validate() []string {
+	var problems []string
+	if r.Month < 1 || r.Month > 12 {
+		problems = append(problems, "month must be between 1 and 12")
 	}
-	return out
+	if r.Year < 2000 || r.Year > 2100 {
+		problems = append(problems, "year is out of range")
+	}
+	if r.OpensAt != nil && r.ClosesAt != nil && !r.ClosesAt.After(*r.OpensAt) {
+		problems = append(problems, "closesAt must be after opensAt")
+	}
+	return problems
 }
 
-// --- submission ---
-
-type SubmittedAnswer struct {
-	QuestionID    string          `json:"questionId"`
-	Value         json.RawMessage `json:"value"`
-	Tags          []string        `json:"tags"`
-	OptedInToFeed bool            `json:"optedInToFeed"`
-}
-
+// SubmitResponseRequest is the fixed 2-field survey payload the schema models: one
+// satisfaction score (1-5) plus an optional open comment, sent for the currently open period.
 type SubmitResponseRequest struct {
-	Answers []SubmittedAnswer `json:"answers"`
+	SatisfactionScore int      `json:"satisfactionScore"`
+	CommentText       string   `json:"commentText"`
+	OptedInToFeed     bool     `json:"optedInToFeed"`
+	Tags              []string `json:"tags"`
 }
 
 func (r *SubmitResponseRequest) Validate() []string {
-	if len(r.Answers) == 0 {
-		return []string{"a submission must contain at least one answer"}
+	var problems []string
+	if r.SatisfactionScore < 1 || r.SatisfactionScore > 5 {
+		problems = append(problems, "satisfactionScore must be between 1 and 5")
 	}
-	return nil
+	return problems
 }
 
-// SubmitResponseReceipt returns the per-submission token, which identifies the submission
-// and never the submitter — there is intentionally no user field on this struct.
+// SubmitResponseReceipt confirms the submission without identifying the submitter — there is
+// intentionally no user field on this struct.
 type SubmitResponseReceipt struct {
-	AnonymousToken string    `json:"anonymousToken"`
-	SubmittedAt    time.Time `json:"submittedAt"`
+	SubmittedAt time.Time `json:"submittedAt"`
 }

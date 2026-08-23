@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"encoding/json"
 	"strings"
 	"time"
 
@@ -9,39 +8,53 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
-	"github.com/mt-sense/backend-service/internal/auth"
+	"github.com/mt-sense/backend-service/internal/analytics"
 	"github.com/mt-sense/backend-service/internal/dto"
 	"github.com/mt-sense/backend-service/internal/middleware"
 	"github.com/mt-sense/backend-service/internal/models"
 	"github.com/mt-sense/backend-service/internal/privacy"
 )
 
-type SurveyHandler struct{ db *gorm.DB }
+type SurveyHandler struct {
+	db    *gorm.DB
+	stats *analytics.Service
+	orgID string
+}
 
-func NewSurveyHandler(db *gorm.DB) *SurveyHandler { return &SurveyHandler{db: db} }
+func NewSurveyHandler(db *gorm.DB, stats *analytics.Service, orgID string) *SurveyHandler {
+	return &SurveyHandler{db: db, stats: stats, orgID: orgID}
+}
 
-// Get returns a survey with its steps and questions, ordered for rendering.
-func (h *SurveyHandler) Get(c *fiber.Ctx) error {
-	var survey models.Survey
-	err := h.db.
-		Preload("Steps", func(db *gorm.DB) *gorm.DB { return db.Order("survey_steps.sort_order") }).
-		Preload("Steps.Questions", func(db *gorm.DB) *gorm.DB { return db.Order("survey_questions.sort_order") }).
-		First(&survey, "id = ?", c.Params("id")).Error
+// Current returns the currently open survey period, if any, and whether the caller already
+// submitted it this period.
+func (h *SurveyHandler) Current(c *fiber.Ctx) error {
+	period, err := h.stats.CurrentOpenPeriod()
 	if err != nil {
-		return fiber.NewError(fiber.StatusNotFound, "survey not found")
+		return err
 	}
-	return c.JSON(dto.NewSurvey(&survey))
+	if period == nil {
+		return fiber.NewError(fiber.StatusNotFound, "no survey period is currently open")
+	}
+
+	var submitted int64
+	err = h.db.Model(&models.SurveySubmission{}).
+		Where("user_id = ? AND period_id = ?", middleware.UserID(c), period.ID).
+		Count(&submitted).Error
+	if err != nil {
+		return err
+	}
+
+	return c.JSON(dto.NewSurveyPeriod(period, submitted > 0, 0))
 }
 
 // Submit stores a response with no link back to the caller.
 //
 // The user id is used for exactly two things, both outside the response itself: reading the
-// submitter's coarse department/tenure so aggregates can be sliced, and stamping the audit
-// log so reminder emails know who still owes a submission. Neither is written into
-// survey_responses, and the whole thing runs in one transaction so an audit row can never
-// exist for a response that failed to save (or vice versa).
+// submitter's coarse department/position so aggregates can be sliced, and recording that a
+// submission happened so the response-rate count and repeat-submission check work. Neither
+// is written into survey_responses, and the whole thing runs in one transaction so a
+// submission record can never exist for a response that failed to save (or vice versa).
 func (h *SurveyHandler) Submit(c *fiber.Ctx) error {
-	surveyID := c.Params("id")
 	userID := middleware.UserID(c)
 
 	var req dto.SubmitResponseRequest
@@ -52,9 +65,12 @@ func (h *SurveyHandler) Submit(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(dto.ValidationErrors{Errors: problems})
 	}
 
-	var survey models.Survey
-	if err := h.db.First(&survey, "id = ?", surveyID).Error; err != nil {
-		return fiber.NewError(fiber.StatusNotFound, "survey not found")
+	period, err := h.stats.CurrentOpenPeriod()
+	if err != nil {
+		return err
+	}
+	if period == nil {
+		return fiber.NewError(fiber.StatusNotFound, "no survey period is currently open")
 	}
 
 	var user models.User
@@ -62,162 +78,108 @@ func (h *SurveyHandler) Submit(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusUnauthorized, "unknown user")
 	}
 
-	// One submission per user per survey — checked against the audit log, which is the
-	// only place that association is allowed to exist.
 	var already int64
-	err := h.db.Model(&models.AuditSubmissionLog{}).
-		Where("user_id = ? AND survey_id = ? AND status = ?", userID, surveyID, "submitted").
+	err = h.db.Model(&models.SurveySubmission{}).
+		Where("user_id = ? AND period_id = ?", userID, period.ID).
 		Count(&already).Error
 	if err != nil {
 		return err
 	}
 	if already > 0 {
-		return fiber.NewError(fiber.StatusConflict, "you have already submitted this survey")
+		return fiber.NewError(fiber.StatusConflict, "you have already submitted this period")
 	}
 
-	questions, err := h.questionsByID(surveyID)
-	if err != nil {
-		return err
-	}
-
-	token, err := auth.AnonymousToken()
-	if err != nil {
-		return err
-	}
 	now := time.Now()
 	response := models.SurveyResponse{
-		ID:             uuid.NewString(),
-		SurveyID:       surveyID,
-		AnonymousToken: token,
-		DepartmentID:   user.DepartmentID,
-		TenureBucket:   user.TenureBucket,
-		SubmittedAt:    now,
-		PeriodMonth:    now.Format("2006-01"),
+		ID:                uuid.NewString(),
+		OrgID:              h.orgID,
+		PeriodID:           period.ID,
+		DepartmentID:       user.DepartmentID,
+		PositionID:         user.PositionID,
+		SatisfactionScore:  int16(req.SatisfactionScore),
+		SubmittedAt:        now,
 	}
 
-	answers := make([]models.ResponseAnswer, 0, len(req.Answers))
-	var feedPosts []models.FeedPost
+	var analysis *models.ResponseAnalysis
+	var feedPost *models.FeedPost
 
-	for _, a := range req.Answers {
-		question, ok := questions[a.QuestionID]
-		if !ok {
-			return fiber.NewError(fiber.StatusBadRequest, "answer refers to a question that is not in this survey: "+a.QuestionID)
-		}
+	comment := strings.TrimSpace(req.CommentText)
+	if comment != "" {
+		// Redact before anything is persisted — the raw text never reaches a table.
+		redacted := privacy.Redact(comment)
+		response.CommentText = redacted
 
-		answer := models.ResponseAnswer{
-			ResponseID:    response.ID,
-			QuestionID:    question.ID,
-			TopicID:       question.TopicID,
-			Value:         a.Value,
-			Tags:          a.Tags,
-			OptedInToFeed: a.OptedInToFeed,
-		}
+		if redacted != "" {
+			sentimentLabel, sentimentScore := classifySentiment(redacted)
+			categories := classifyCategories(redacted)
+			confidence, lowConfidence := confidenceFor(categories, sentimentScore)
 
-		switch question.Type {
-		case models.QuestionScale5, models.QuestionENPS:
-			var n float64
-			if err := json.Unmarshal(a.Value, &n); err != nil {
-				return fiber.NewError(fiber.StatusBadRequest, "question "+question.ID+" expects a number")
+			analysis = &models.ResponseAnalysis{
+				ID:             uuid.NewString(),
+				ResponseID:     response.ID,
+				SentimentLabel: sentimentLabel,
+				SentimentScore: sentimentScore,
+				Confidence:     confidence,
+				LowConfidence:  lowConfidence,
+				Categories:     categories,
+				AnalyzedAt:     now,
 			}
-			if !validNumericAnswer(question.Type, n) {
-				return fiber.NewError(fiber.StatusBadRequest, "value out of range for question "+question.ID)
-			}
-			answer.NumericValue = &n
-
-		case models.QuestionOpenText:
-			var text string
-			if err := json.Unmarshal(a.Value, &text); err != nil {
-				return fiber.NewError(fiber.StatusBadRequest, "question "+question.ID+" expects text")
-			}
-			// Redact before anything is persisted — the raw text never reaches a table.
-			redacted := privacy.Redact(strings.TrimSpace(text))
-			answer.TextRedacted = redacted
-			answer.Sentiment = classifySentiment(redacted)
-			answer.Value = json.RawMessage(mustJSON(redacted))
 
 			// Gate one of the feed flow: the author opted in. Gate two (moderation) is a
 			// separate HR action, so the post starts unpublished.
-			if question.AllowPublish && a.OptedInToFeed && redacted != "" {
-				feedPosts = append(feedPosts, models.FeedPost{
+			if req.OptedInToFeed {
+				tags := req.Tags
+				if len(tags) == 0 {
+					tags = categories
+				}
+				feedPost = &models.FeedPost{
 					ID:        uuid.NewString(),
+					OrgID:     h.orgID,
 					Text:      redacted,
-					Hashtags:  a.Tags,
+					Hashtags:  tags,
 					PostedOn:  now.Format("2006-01-02"),
 					OptedIn:   true,
 					Published: false,
-				})
+				}
 			}
 		}
-
-		answers = append(answers, answer)
 	}
 
 	err = h.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&response).Error; err != nil {
 			return err
 		}
-		if err := tx.Create(&answers).Error; err != nil {
-			return err
-		}
-		if len(feedPosts) > 0 {
-			if err := tx.Create(&feedPosts).Error; err != nil {
+		if analysis != nil {
+			if err := tx.Create(analysis).Error; err != nil {
 				return err
 			}
 		}
-		// Audit log: separate table, records only that a submission happened.
-		return tx.Where(models.AuditSubmissionLog{UserID: userID, SurveyID: surveyID}).
-			Assign(models.AuditSubmissionLog{Status: "submitted", SubmittedAt: &now}).
-			FirstOrCreate(&models.AuditSubmissionLog{}).Error
+		if feedPost != nil {
+			if err := tx.Create(feedPost).Error; err != nil {
+				return err
+			}
+		}
+		return tx.Create(&models.SurveySubmission{
+			ID:          uuid.NewString(),
+			OrgID:       h.orgID,
+			UserID:      userID,
+			PeriodID:    period.ID,
+			SubmittedAt: now,
+		}).Error
 	})
 	if err != nil {
 		return err
 	}
 
-	// The receipt identifies the submission, never the submitter.
-	return c.Status(fiber.StatusCreated).JSON(dto.SubmitResponseReceipt{
-		AnonymousToken: token,
-		SubmittedAt:    now,
-	})
+	// The receipt confirms the submission, never the submitter.
+	return c.Status(fiber.StatusCreated).JSON(dto.SubmitResponseReceipt{SubmittedAt: now})
 }
 
-func validNumericAnswer(t models.QuestionType, n float64) bool {
-	if t == models.QuestionScale5 {
-		return n >= 1 && n <= 5
-	}
-	return n >= 0 && n <= 10
-}
-
-func (h *SurveyHandler) questionsByID(surveyID string) (map[string]models.SurveyQuestion, error) {
-	var questions []models.SurveyQuestion
-	err := h.db.
-		Joins("JOIN survey_steps ON survey_steps.id = survey_questions.step_id").
-		Where("survey_steps.survey_id = ?", surveyID).
-		Find(&questions).Error
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[string]models.SurveyQuestion, len(questions))
-	for _, q := range questions {
-		out[q.ID] = q
-	}
-	return out, nil
-}
-
-func mustJSON(v any) []byte {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return []byte(`""`)
-	}
-	return b
-}
-
-// classifySentiment is a keyword heuristic standing in for the analysis pipeline.
+// classifySentiment and classifyCategories are keyword heuristics standing in for the
+// analysis pipeline.
 // ponytail: lexicon lookup, no negation handling; replace with the real classifier — the
-// column it writes and every aggregate reading it stay the same.
-func classifySentiment(text string) string {
-	if strings.TrimSpace(text) == "" {
-		return ""
-	}
+// columns they write and every aggregate reading them stay the same.
+func classifySentiment(text string) (label string, score float32) {
 	lowered := strings.ToLower(text)
 	positive, negative := 0, 0
 	for _, w := range positiveWords {
@@ -230,17 +192,63 @@ func classifySentiment(text string) string {
 			negative++
 		}
 	}
+	total := positive + negative
 	switch {
 	case positive > negative:
-		return "positive"
+		if total > 0 {
+			score = float32(positive-negative) / float32(total)
+		}
+		return "pos", score
 	case negative > positive:
-		return "negative"
+		if total > 0 {
+			score = float32(positive-negative) / float32(total)
+		}
+		return "neg", score
 	default:
-		return "neutral"
+		return "neu", 0
 	}
+}
+
+// classifyCategories tags a comment with topics from the fixed taxonomy by keyword match.
+func classifyCategories(text string) []string {
+	lowered := strings.ToLower(text)
+	var categories []string
+	for _, topicID := range topicOrder {
+		for _, w := range topicKeywords[topicID] {
+			if strings.Contains(lowered, w) {
+				categories = append(categories, topicID)
+				break
+			}
+		}
+	}
+	return categories
+}
+
+func confidenceFor(categories []string, sentimentScore float32) (confidence float32, low bool) {
+	confidence = 0.5 + float32(len(categories))*0.1
+	if sentimentScore < 0 {
+		sentimentScore = -sentimentScore
+	}
+	confidence += sentimentScore * 0.1
+	if confidence > 0.95 {
+		confidence = 0.95
+	}
+	return confidence, confidence < 0.6
 }
 
 var (
 	positiveWords = []string{"ดี", "ชอบ", "ขอบคุณ", "สนุก", "ประทับใจ", "ดีขึ้น", "สนับสนุน", "good", "great", "love", "thanks", "better"}
 	negativeWords = []string{"หนัก", "เหนื่อย", "ไม่พอ", "ล่าช้า", "ไม่ชัดเจน", "ปัญหา", "แย่", "เครียด", "ไม่เป็นธรรม", "bad", "tired", "unclear", "problem", "stress", "overwork"}
+
+	// topicOrder keeps classification output deterministic (map iteration order is not).
+	topicOrder = []string{"work", "team", "manager", "compensation", "growth", "benefits"}
+
+	topicKeywords = map[string][]string{
+		"work":         {"งาน", "ภาระงาน", "กะดึก", "ot", "โอที", "workload", "overtime", "shift"},
+		"team":         {"ทีม", "เพื่อนร่วมงาน", "team", "colleague"},
+		"manager":      {"หัวหน้า", "ผู้จัดการ", "manager", "supervisor", "feedback", "ฟีดแบ็ก"},
+		"compensation": {"เงินเดือน", "ค่าตอบแทน", "โบนัส", "salary", "compensation", "bonus", "pay"},
+		"growth":       {"เติบโต", "โอกาส", "เส้นทางอาชีพ", "growth", "career", "promotion", "training", "ฝึกอบรม"},
+		"benefits":     {"สวัสดิการ", "ประกัน", "ลาพัก", "benefits", "insurance", "leave", "wellness"},
+	}
 )

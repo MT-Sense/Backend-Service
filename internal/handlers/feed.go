@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
@@ -17,17 +18,18 @@ import (
 type FeedHandler struct {
 	db         *gorm.DB
 	voteSecret string
+	orgID      string
 }
 
-func NewFeedHandler(db *gorm.DB, voteSecret string) *FeedHandler {
-	return &FeedHandler{db: db, voteSecret: voteSecret}
+func NewFeedHandler(db *gorm.DB, voteSecret string, orgID string) *FeedHandler {
+	return &FeedHandler{db: db, voteSecret: voteSecret, orgID: orgID}
 }
 
 // List serves the public feed. The two-gate rule is a WHERE clause, not a display filter:
 // a post that has not been both opted into and published is never selected, so no amount of
 // client tampering can surface one.
 func (h *FeedHandler) List(c *fiber.Ctx) error {
-	query := h.db.Model(&models.FeedPost{}).Where("opted_in = ? AND published = ?", true, true)
+	query := h.db.Model(&models.FeedPost{}).Where("org_id = ? AND opted_in = ? AND published = ?", h.orgID, true, true)
 
 	if tag := c.Query("tag"); tag != "" {
 		// hashtags is a JSON array column; match membership rather than substring.
@@ -83,7 +85,7 @@ func (h *FeedHandler) Vote(c *fiber.Ctx) error {
 	}
 
 	var post models.FeedPost
-	err := h.db.Where("id = ? AND opted_in = ? AND published = ?", postID, true, true).First(&post).Error
+	err := h.db.Where("id = ? AND org_id = ? AND opted_in = ? AND published = ?", postID, h.orgID, true, true).First(&post).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return fiber.NewError(fiber.StatusNotFound, "post not found")
 	}
@@ -128,7 +130,7 @@ var errAlreadyVoted = errors.New("already voted")
 // only ever see reviewed content.
 func (h *FeedHandler) Summaries(c *fiber.Ctx) error {
 	var summaries []models.PublishedSummary
-	if err := h.db.Order("published_at DESC").Find(&summaries).Error; err != nil {
+	if err := h.db.Where("org_id = ?", h.orgID).Order("published_at DESC").Find(&summaries).Error; err != nil {
 		return err
 	}
 	return c.JSON(dto.NewPublishedSummaries(summaries))
@@ -137,10 +139,45 @@ func (h *FeedHandler) Summaries(c *fiber.Ctx) error {
 // ActionItems lists what the company has committed to, for the feed sidebar.
 func (h *FeedHandler) ActionItems(c *fiber.Ctx) error {
 	var items []models.ActionItem
-	if err := h.db.Order("created_at DESC").Find(&items).Error; err != nil {
+	if err := h.db.Where("org_id = ?", h.orgID).Order("created_at DESC").Find(&items).Error; err != nil {
 		return err
 	}
 	return c.JSON(dto.NewActionItems(items))
+}
+
+// CreateActionItem lets HR or Executive open a follow-up. Executive-authored items are
+// marked decision-level; HR-authored (admin) items are full-level.
+func (h *FeedHandler) CreateActionItem(c *fiber.Ctx) error {
+	var req dto.CreateActionItemRequest
+	if err := c.BodyParser(&req); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "malformed request body")
+	}
+	if problems := req.Validate(); len(problems) > 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(dto.ValidationErrors{Errors: problems})
+	}
+
+	role := middleware.CurrentRole(c)
+	level := "full"
+	if role == models.RoleExecutive {
+		level = "decision"
+	}
+
+	item := models.ActionItem{
+		ID:         uuid.NewString(),
+		OrgID:      h.orgID,
+		Topic:      req.Topic,
+		TopicID:    req.TopicID,
+		Assignee:   req.Assignee,
+		Status:     "in_progress",
+		CreatedBy:  role,
+		Level:      level,
+		TargetDate: req.TargetDate,
+		CreatedAt:  time.Now(),
+	}
+	if err := h.db.Create(&item).Error; err != nil {
+		return err
+	}
+	return c.Status(fiber.StatusCreated).JSON(dto.NewActionItem(&item))
 }
 
 // Moderate is gate two of the publish flow: HR reviewing a post that its author already
@@ -155,7 +192,7 @@ func (h *FeedHandler) Moderate(c *fiber.Ctx) error {
 	}
 
 	var post models.FeedPost
-	if err := h.db.First(&post, "id = ?", c.Params("id")).Error; err != nil {
+	if err := h.db.Where("id = ? AND org_id = ?", c.Params("id"), h.orgID).First(&post).Error; err != nil {
 		return fiber.NewError(fiber.StatusNotFound, "post not found")
 	}
 
@@ -179,7 +216,7 @@ func (h *FeedHandler) Moderate(c *fiber.Ctx) error {
 // PendingModeration lists opted-in posts still awaiting HR review (HR only).
 func (h *FeedHandler) PendingModeration(c *fiber.Ctx) error {
 	var posts []models.FeedPost
-	err := h.db.Where("opted_in = ? AND published = ?", true, false).
+	err := h.db.Where("org_id = ? AND opted_in = ? AND published = ?", h.orgID, true, false).
 		Order("posted_on DESC").Find(&posts).Error
 	if err != nil {
 		return err
