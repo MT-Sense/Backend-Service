@@ -1,7 +1,10 @@
 package router
 
 import (
+	"time"
+
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/limiter"
 	"gorm.io/gorm"
 
 	"github.com/mt-sense/backend-service/internal/analytics"
@@ -12,6 +15,19 @@ import (
 	"github.com/mt-sense/backend-service/internal/models"
 )
 
+// onboardingLimiter is a per-route, per-IP limiter for the public onboarding endpoints — the
+// guessing surface for the 6-char join code and the optional company password. Deliberately
+// not a global app.Use(...) so normal authenticated traffic is never throttled by it.
+func onboardingLimiter(max int, expiration time.Duration) fiber.Handler {
+	return limiter.New(limiter.Config{
+		Max:        max,
+		Expiration: expiration,
+		KeyGenerator: func(c *fiber.Ctx) string {
+			return c.IP()
+		},
+	})
+}
+
 // Register wires every route.
 //
 // Role guards are attached per route rather than via Group("", mw): a group with an empty
@@ -19,18 +35,20 @@ import (
 // silently makes later groups inherit earlier role checks. Naming the guard on each route
 // keeps the permission matrix readable and impossible to inherit by accident.
 //
-// orgID is the single seeded organization's id — the app is single-tenant for now (see
-// README), but every query is already scoped by it so multi-tenancy is a matter of deriving
-// orgID per-request later rather than retrofitting every handler.
-func Register(app *fiber.App, db *gorm.DB, cfg *config.Config, orgID string) {
+// Org resolution is per-request: after login, org comes from the JWT claim (middleware.OrgID);
+// before login (join-by-code), it comes from the join code itself. No handler holds a
+// boot-time org constant anymore — analytics.Service is shared read-only across requests and
+// cloned per-request via Service.WithOrg.
+func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) {
 	issuer := auth.NewIssuer(cfg.JWTSecret, cfg.AccessTTL, cfg.RefreshTTL)
-	stats := analytics.New(db, orgID)
+	stats := analytics.New(db)
 
-	authH := handlers.NewAuthHandler(db, issuer, orgID)
-	dashH := handlers.NewDashboardHandler(db, stats, orgID)
-	surveyH := handlers.NewSurveyHandler(db, stats, orgID)
-	feedH := handlers.NewFeedHandler(db, cfg.JWTSecret, orgID)
-	periodsH := handlers.NewPeriodsHandler(db, stats, orgID)
+	authH := handlers.NewAuthHandler(db, issuer)
+	dashH := handlers.NewDashboardHandler(db, stats)
+	surveyH := handlers.NewSurveyHandler(db, stats)
+	feedH := handlers.NewFeedHandler(db, cfg.JWTSecret)
+	periodsH := handlers.NewPeriodsHandler(db, stats)
+	onboardH := handlers.NewOnboardingHandler(db, issuer)
 
 	adminOnly := middleware.RequireRole(models.RoleAdmin)
 	execOnly := middleware.RequireRole(models.RoleExecutive)
@@ -46,6 +64,14 @@ func Register(app *fiber.App, db *gorm.DB, cfg *config.Config, orgID string) {
 	api.Post("/auth/login", authH.Login)
 	api.Post("/auth/refresh", authH.Refresh)
 
+	// Self-service onboarding — see internal/handlers/onboarding.go. Rate limited (§4 of the
+	// onboarding plan): these are the guessing surface for the 6-char join code and the
+	// optional company password.
+	api.Post("/onboarding/signup", onboardingLimiter(5, 10*time.Minute), onboardH.Signup)
+	api.Post("/onboarding/join/check", onboardingLimiter(10, time.Minute), onboardH.CheckJoinCode)
+	api.Post("/onboarding/join/verify-password", onboardingLimiter(10, time.Minute), onboardH.CheckCompanyPassword)
+	api.Post("/onboarding/join/register", onboardingLimiter(5, time.Minute), onboardH.RegisterEmployee)
+
 	// --- authenticated: everything below requires a valid access token ---
 	r := api.Group("", middleware.RequireAuth(issuer))
 
@@ -57,6 +83,7 @@ func Register(app *fiber.App, db *gorm.DB, cfg *config.Config, orgID string) {
 	r.Get("/topics", dashH.Topics)
 	r.Get("/departments", dashH.Departments)
 	r.Get("/positions", dashH.Positions)
+	r.Get("/survey-questions/catalog", surveyH.Catalog)
 
 	// Employee-facing surfaces — open to all three roles, since admin (HR) and executives
 	// also fill in surveys and read the feed.
@@ -74,12 +101,17 @@ func Register(app *fiber.App, db *gorm.DB, cfg *config.Config, orgID string) {
 	r.Get("/dashboard/hr/wordcloud", adminOnly, dashH.WordCloud)
 	r.Get("/dashboard/hr/insight", adminOnly, dashH.Insight)
 	r.Get("/dashboard/hr/alerts", adminOnly, dashH.Alerts)
+	r.Get("/dashboard/hr/extra-questions", adminOnly, dashH.ExtraQuestions)
 	r.Get("/dashboard/hr/topics/:id", adminOnly, dashH.TopicDrilldown)
 	r.Get("/survey-periods", adminOnly, periodsH.List)
 	r.Post("/survey-periods", adminOnly, periodsH.Create)
 	r.Post("/survey-periods/:id/close", adminOnly, periodsH.Close)
 	r.Get("/feed/pending", adminOnly, feedH.PendingModeration)
 	r.Patch("/feed/:id/moderate", adminOnly, feedH.Moderate)
+	r.Get("/org/join-code", adminOnly, onboardH.GetJoinCode)
+	r.Post("/org/join-code/regenerate", adminOnly, onboardH.RegenerateJoinCode)
+	r.Get("/org/settings", adminOnly, onboardH.GetOrgSettings)
+	r.Patch("/org/settings", adminOnly, onboardH.UpdateOrgSettings)
 
 	// Executive only — aggregates, no raw text by construction.
 	r.Get("/dashboard/executive/summary", execOnly, dashH.ExecutiveSummary)

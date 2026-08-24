@@ -121,6 +121,40 @@ func TestSubmitResponseRequestValidatesScoreRange(t *testing.T) {
 	}
 }
 
+func TestSubmitResponseRequestValidatesExtraAnswers(t *testing.T) {
+	unknownKey := SubmitResponseRequest{SatisfactionScore: 4, ExtraAnswers: map[string]int{"nope": 3}}
+	if problems := unknownKey.Validate(); len(problems) == 0 {
+		t.Error("unknown extra question key should be rejected")
+	}
+
+	scaleOutOfRange := SubmitResponseRequest{SatisfactionScore: 4, ExtraAnswers: map[string]int{"work": 6}}
+	if problems := scaleOutOfRange.Validate(); len(problems) == 0 {
+		t.Error("scale value of 6 should be rejected")
+	}
+
+	enpsOutOfRange := SubmitResponseRequest{SatisfactionScore: 4, ExtraAnswers: map[string]int{"enps": 11}}
+	if problems := enpsOutOfRange.Validate(); len(problems) == 0 {
+		t.Error("enps value of 11 should be rejected")
+	}
+
+	valid := SubmitResponseRequest{SatisfactionScore: 4, ExtraAnswers: map[string]int{"work": 5, "enps": 10}}
+	if problems := valid.Validate(); len(problems) > 0 {
+		t.Errorf("valid extra answers rejected: %v", problems)
+	}
+}
+
+func TestCreatePeriodRequestValidatesExtraQuestionKeys(t *testing.T) {
+	req := CreatePeriodRequest{Month: 1, Year: 2026, EnabledExtraQuestions: []string{"work", "not-a-real-key"}}
+	if problems := req.Validate(); len(problems) == 0 {
+		t.Error("unknown extra question key should be rejected")
+	}
+
+	valid := CreatePeriodRequest{Month: 1, Year: 2026, EnabledExtraQuestions: []string{"work", "enps"}}
+	if problems := valid.Validate(); len(problems) > 0 {
+		t.Errorf("valid enabled questions rejected: %v", problems)
+	}
+}
+
 func TestSubmitResponseReceiptHasNoUserField(t *testing.T) {
 	encoded, err := json.Marshal(SubmitResponseReceipt{SubmittedAt: time.Now()})
 	if err != nil {

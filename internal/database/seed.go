@@ -19,12 +19,16 @@ import (
 // dashboard number is produced by the actual SQL — including the n<5 rule, which the
 // deliberately tiny "innovation" team exercises end to end.
 func Seed(db *gorm.DB) error {
+	// Scoped to the demo org specifically (not "any org exists") so this stays self-healing
+	// once real customer orgs exist via self-service signup — every boot re-checks whether
+	// the demo org itself is present, rather than treating any org's existence as "already
+	// seeded".
 	var existing int64
-	if err := db.Model(&models.Organization{}).Count(&existing).Error; err != nil {
+	if err := db.Model(&models.Organization{}).Where("slug = ?", "mt-sense").Count(&existing).Error; err != nil {
 		return err
 	}
 	if existing > 0 {
-		log.Println("database: seed skipped, data already present")
+		log.Println("database: demo org already present, skipping seed")
 		return nil
 	}
 
@@ -60,7 +64,12 @@ func Seed(db *gorm.DB) error {
 const seedOrgID = "org-mt-sense"
 
 func seedOrganization(tx *gorm.DB) (string, error) {
-	org := models.Organization{ID: seedOrgID, Name: "MT-Sense Demo Co., Ltd.", Slug: "mt-sense"}
+	// JoinCode is a fixed, memorable literal (not randomly generated via auth.JoinCode) since
+	// the demo org is a known fixture referenced in docs and manual testing.
+	org := models.Organization{
+		ID: seedOrgID, Name: "MT-Sense Demo Co., Ltd.", Slug: "mt-sense",
+		JoinCode: "DEMO01", CollectDepartment: true, CollectTenure: false,
+	}
 	if err := tx.Create(&org).Error; err != nil {
 		return "", err
 	}

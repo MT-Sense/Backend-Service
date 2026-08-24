@@ -9,6 +9,7 @@ import (
 
 	"github.com/mt-sense/backend-service/internal/analytics"
 	"github.com/mt-sense/backend-service/internal/dto"
+	"github.com/mt-sense/backend-service/internal/middleware"
 	"github.com/mt-sense/backend-service/internal/models"
 )
 
@@ -17,23 +18,25 @@ import (
 type PeriodsHandler struct {
 	db    *gorm.DB
 	stats *analytics.Service
-	orgID string
 }
 
-func NewPeriodsHandler(db *gorm.DB, stats *analytics.Service, orgID string) *PeriodsHandler {
-	return &PeriodsHandler{db: db, stats: stats, orgID: orgID}
+func NewPeriodsHandler(db *gorm.DB, stats *analytics.Service) *PeriodsHandler {
+	return &PeriodsHandler{db: db, stats: stats}
 }
 
 // List returns every survey period for the org, newest first, with response counts.
 func (h *PeriodsHandler) List(c *fiber.Ctx) error {
+	orgID := middleware.OrgID(c)
+	stats := h.stats.WithOrg(orgID)
+
 	var periods []models.SurveyPeriod
-	if err := h.db.Where("org_id = ?", h.orgID).Order("year DESC, month DESC").Find(&periods).Error; err != nil {
+	if err := h.db.Where("org_id = ?", orgID).Order("year DESC, month DESC").Find(&periods).Error; err != nil {
 		return err
 	}
 
 	counts := make(map[string]int64, len(periods))
 	for _, p := range periods {
-		n, err := h.stats.TotalRespondents(p.ID)
+		n, err := stats.TotalRespondents(p.ID)
 		if err != nil {
 			return err
 		}
@@ -64,12 +67,13 @@ func (h *PeriodsHandler) Create(c *fiber.Ctx) error {
 	}
 
 	period := models.SurveyPeriod{
-		ID:       uuid.NewString(),
-		OrgID:    h.orgID,
-		Month:    int16(req.Month),
-		Year:     int16(req.Year),
-		OpensAt:  opens,
-		ClosesAt: closes,
+		ID:                    uuid.NewString(),
+		OrgID:                 middleware.OrgID(c),
+		Month:                 int16(req.Month),
+		Year:                  int16(req.Year),
+		OpensAt:               opens,
+		ClosesAt:              closes,
+		EnabledExtraQuestions: req.EnabledExtraQuestions,
 	}
 	if err := h.db.Create(&period).Error; err != nil {
 		return err
@@ -80,8 +84,11 @@ func (h *PeriodsHandler) Create(c *fiber.Ctx) error {
 // Close ends a period early (sets closes_at to now if it hasn't passed yet) and generates
 // its alerts.
 func (h *PeriodsHandler) Close(c *fiber.Ctx) error {
+	orgID := middleware.OrgID(c)
+	stats := h.stats.WithOrg(orgID)
+
 	var period models.SurveyPeriod
-	if err := h.db.Where("org_id = ? AND id = ?", h.orgID, c.Params("id")).First(&period).Error; err != nil {
+	if err := h.db.Where("org_id = ? AND id = ?", orgID, c.Params("id")).First(&period).Error; err != nil {
 		return fiber.NewError(fiber.StatusNotFound, "survey period not found")
 	}
 
@@ -93,11 +100,11 @@ func (h *PeriodsHandler) Close(c *fiber.Ctx) error {
 		}
 	}
 
-	if err := h.stats.GenerateAlerts(&period); err != nil {
+	if err := stats.GenerateAlerts(&period); err != nil {
 		return err
 	}
 
-	n, err := h.stats.TotalRespondents(period.ID)
+	n, err := stats.TotalRespondents(period.ID)
 	if err != nil {
 		return err
 	}

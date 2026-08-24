@@ -13,6 +13,7 @@ import (
 
 const (
 	ctxUserID = "userID"
+	ctxOrgID  = "orgID"
 	ctxRole   = "role"
 )
 
@@ -34,6 +35,7 @@ func RequireAuth(issuer *auth.Issuer) fiber.Handler {
 		}
 
 		c.Locals(ctxUserID, claims.UserID)
+		c.Locals(ctxOrgID, claims.OrgID)
 		c.Locals(ctxRole, claims.Role)
 		return c.Next()
 	}
@@ -67,4 +69,11 @@ func UserID(c *fiber.Ctx) string {
 func CurrentRole(c *fiber.Ctx) models.Role {
 	role, _ := c.Locals(ctxRole).(models.Role)
 	return role
+}
+
+// OrgID returns the authenticated user's organization id, or "" when unauthenticated. This
+// is the per-request replacement for the old boot-time constant every handler used to share.
+func OrgID(c *fiber.Ctx) string {
+	id, _ := c.Locals(ctxOrgID).(string)
+	return id
 }

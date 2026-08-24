@@ -18,18 +18,17 @@ import (
 type FeedHandler struct {
 	db         *gorm.DB
 	voteSecret string
-	orgID      string
 }
 
-func NewFeedHandler(db *gorm.DB, voteSecret string, orgID string) *FeedHandler {
-	return &FeedHandler{db: db, voteSecret: voteSecret, orgID: orgID}
+func NewFeedHandler(db *gorm.DB, voteSecret string) *FeedHandler {
+	return &FeedHandler{db: db, voteSecret: voteSecret}
 }
 
 // List serves the public feed. The two-gate rule is a WHERE clause, not a display filter:
 // a post that has not been both opted into and published is never selected, so no amount of
 // client tampering can surface one.
 func (h *FeedHandler) List(c *fiber.Ctx) error {
-	query := h.db.Model(&models.FeedPost{}).Where("org_id = ? AND opted_in = ? AND published = ?", h.orgID, true, true)
+	query := h.db.Model(&models.FeedPost{}).Where("org_id = ? AND opted_in = ? AND published = ?", middleware.OrgID(c), true, true)
 
 	if tag := c.Query("tag"); tag != "" {
 		// hashtags is a JSON array column; match membership rather than substring.
@@ -85,7 +84,7 @@ func (h *FeedHandler) Vote(c *fiber.Ctx) error {
 	}
 
 	var post models.FeedPost
-	err := h.db.Where("id = ? AND org_id = ? AND opted_in = ? AND published = ?", postID, h.orgID, true, true).First(&post).Error
+	err := h.db.Where("id = ? AND org_id = ? AND opted_in = ? AND published = ?", postID, middleware.OrgID(c), true, true).First(&post).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return fiber.NewError(fiber.StatusNotFound, "post not found")
 	}
@@ -130,7 +129,7 @@ var errAlreadyVoted = errors.New("already voted")
 // only ever see reviewed content.
 func (h *FeedHandler) Summaries(c *fiber.Ctx) error {
 	var summaries []models.PublishedSummary
-	if err := h.db.Where("org_id = ?", h.orgID).Order("published_at DESC").Find(&summaries).Error; err != nil {
+	if err := h.db.Where("org_id = ?", middleware.OrgID(c)).Order("published_at DESC").Find(&summaries).Error; err != nil {
 		return err
 	}
 	return c.JSON(dto.NewPublishedSummaries(summaries))
@@ -139,7 +138,7 @@ func (h *FeedHandler) Summaries(c *fiber.Ctx) error {
 // ActionItems lists what the company has committed to, for the feed sidebar.
 func (h *FeedHandler) ActionItems(c *fiber.Ctx) error {
 	var items []models.ActionItem
-	if err := h.db.Where("org_id = ?", h.orgID).Order("created_at DESC").Find(&items).Error; err != nil {
+	if err := h.db.Where("org_id = ?", middleware.OrgID(c)).Order("created_at DESC").Find(&items).Error; err != nil {
 		return err
 	}
 	return c.JSON(dto.NewActionItems(items))
@@ -164,7 +163,7 @@ func (h *FeedHandler) CreateActionItem(c *fiber.Ctx) error {
 
 	item := models.ActionItem{
 		ID:         uuid.NewString(),
-		OrgID:      h.orgID,
+		OrgID:      middleware.OrgID(c),
 		Topic:      req.Topic,
 		TopicID:    req.TopicID,
 		Assignee:   req.Assignee,
@@ -192,7 +191,7 @@ func (h *FeedHandler) Moderate(c *fiber.Ctx) error {
 	}
 
 	var post models.FeedPost
-	if err := h.db.Where("id = ? AND org_id = ?", c.Params("id"), h.orgID).First(&post).Error; err != nil {
+	if err := h.db.Where("id = ? AND org_id = ?", c.Params("id"), middleware.OrgID(c)).First(&post).Error; err != nil {
 		return fiber.NewError(fiber.StatusNotFound, "post not found")
 	}
 
@@ -216,7 +215,7 @@ func (h *FeedHandler) Moderate(c *fiber.Ctx) error {
 // PendingModeration lists opted-in posts still awaiting HR review (HR only).
 func (h *FeedHandler) PendingModeration(c *fiber.Ctx) error {
 	var posts []models.FeedPost
-	err := h.db.Where("org_id = ? AND opted_in = ? AND published = ?", h.orgID, true, false).
+	err := h.db.Where("org_id = ? AND opted_in = ? AND published = ?", middleware.OrgID(c), true, false).
 		Order("posted_on DESC").Find(&posts).Error
 	if err != nil {
 		return err

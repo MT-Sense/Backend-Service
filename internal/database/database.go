@@ -9,11 +9,20 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
+	"github.com/mt-sense/backend-service/internal/auth"
 	"github.com/mt-sense/backend-service/internal/models"
 )
 
 func Connect(dsn string) (*gorm.DB, error) {
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+	// PreferSimpleProtocol disables server-side prepared statements. Required against Neon's
+	// pooled connection string (the "-pooler" host): PgBouncer-style transaction pooling can
+	// hand a query a different backend connection than the one that cached its plan, and once
+	// a migration changes a table's columns, any connection still holding the old plan fails
+	// every subsequent "SELECT *" against that table with `cached plan must not change result
+	// type` (SQLSTATE 0A000) — discovered while testing this migration end-to-end. Simple
+	// protocol re-plans every query, which costs a little throughput but is the standard fix
+	// for gorm/pgx behind a transaction-pooling proxy.
+	db, err := gorm.Open(postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true}), &gorm.Config{
 		Logger:  logger.Default.LogMode(logger.Warn),
 		NowFunc: func() time.Time { return time.Now().UTC() },
 	})
@@ -47,6 +56,7 @@ var enumTypes = []struct {
 		"low_response_rate",
 		"sentiment_drop",
 	}},
+	{"tenure_bucket", []string{"under_1y", "1_3y", "3_5y", "5y_plus"}},
 }
 
 // Bootstrap creates the pgcrypto extension and the Postgres enum types the schema depends
@@ -87,32 +97,76 @@ func joinComma(values []string) string {
 	return out
 }
 
-// DefaultOrgID resolves the single seeded organization's id. The app is single-tenant for
-// now (see README) — every handler is already scoped by org_id, so this is the one place a
-// future multi-tenant login flow would change to resolve per-request instead.
-func DefaultOrgID(db *gorm.DB) (string, error) {
+// DemoOrgID resolves the seeded demo organization's id (slug "mt-sense"). The app is now
+// multi-tenant per-request (org resolved from JWT claim after login, from join code before
+// it) — this function only remains for seed.go's self-healing check, not for request-time
+// org resolution.
+func DemoOrgID(db *gorm.DB) (string, error) {
 	var id string
-	err := db.Raw(`SELECT id FROM organizations ORDER BY created_at LIMIT 1`).Scan(&id).Error
+	err := db.Raw(`SELECT id FROM organizations WHERE slug = 'mt-sense' LIMIT 1`).Scan(&id).Error
 	if err != nil {
-		return "", fmt.Errorf("resolving default organization: %w", err)
+		return "", fmt.Errorf("resolving demo organization: %w", err)
 	}
 	if id == "" {
-		return "", fmt.Errorf("no organization found — has the database been seeded?")
+		return "", fmt.Errorf("demo organization not found — has the database been seeded?")
 	}
 	return id, nil
+}
+
+// dropLegacyIndexes removes indexes from a prior schema revision that AutoMigrate will not
+// drop on its own (it only adds/alters, never drops). uq_users_org_email was the per-org
+// composite unique index on users(org_id,email); email uniqueness is now global so that
+// login can resolve org purely from email with no company picker.
+func dropLegacyIndexes(db *gorm.DB) error {
+	if err := db.Exec(`DROP INDEX IF EXISTS uq_users_org_email`).Error; err != nil {
+		return fmt.Errorf("dropping legacy uq_users_org_email index: %w", err)
+	}
+	return nil
 }
 
 func Migrate(db *gorm.DB) error {
 	if err := Bootstrap(db); err != nil {
 		return fmt.Errorf("bootstrapping schema: %w", err)
 	}
+	if err := dropLegacyIndexes(db); err != nil {
+		return fmt.Errorf("dropping legacy indexes: %w", err)
+	}
 	if err := db.AutoMigrate(models.AllModels()...); err != nil {
 		return fmt.Errorf("running migrations: %w", err)
+	}
+	if err := backfillJoinCodes(db); err != nil {
+		return fmt.Errorf("backfilling join codes: %w", err)
 	}
 	if err := installTriggers(db); err != nil {
 		return fmt.Errorf("installing triggers: %w", err)
 	}
 	log.Println("database: migrations applied")
+	return nil
+}
+
+// backfillJoinCodes assigns a real join code to any organization left with the '' the
+// JoinCode column's migration default produced (see the field's doc comment in models.go) —
+// rows that existed before this column was added. The demo org gets the fixed "DEMO01" to
+// match seed.go's convention; anything else gets a freshly generated code.
+func backfillJoinCodes(db *gorm.DB) error {
+	var orgs []models.Organization
+	if err := db.Where("join_code = ''").Find(&orgs).Error; err != nil {
+		return err
+	}
+	for _, org := range orgs {
+		code := "DEMO01"
+		if org.Slug != "mt-sense" {
+			generated, err := auth.JoinCode()
+			if err != nil {
+				return err
+			}
+			code = generated
+		}
+		if err := db.Model(&models.Organization{}).Where("id = ?", org.ID).Update("join_code", code).Error; err != nil {
+			return err
+		}
+		log.Printf("database: backfilled join code for org %q", org.Slug)
+	}
 	return nil
 }
 

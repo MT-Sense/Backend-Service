@@ -68,6 +68,27 @@ type Organization struct {
 	Slug      string    `gorm:"column:slug;size:100;not null;uniqueIndex:uq_organizations_slug" json:"slug"`
 	CreatedAt time.Time `gorm:"column:created_at" json:"-"`
 	UpdatedAt time.Time `gorm:"column:updated_at" json:"-"`
+
+	// JoinCode is a plaintext, canonically-uppercase, redistributable identifier (not a
+	// secret by itself — CompanyPasswordHash is the optional secret layer in front of it)
+	// that self-service employees enter at /join to reach this org's registration form.
+	// default:'' lets AutoMigrate add this NOT NULL column to a table that already has rows
+	// (Postgres requires a default to backfill existing rows) — database.backfillJoinCodes
+	// then replaces any '' with a real generated code right after migration.
+	JoinCode string `gorm:"column:join_code;size:6;not null;default:'';uniqueIndex:uq_organizations_join_code" json:"-"`
+	// CompanyPasswordHash is bcrypt, nullable — nil means no company-password gate is set.
+	CompanyPasswordHash *string `gorm:"column:company_password_hash;size:255" json:"-"`
+	// CollectDepartment/CollectTenure toggle which optional fields the self-service
+	// registration form asks for; baseline fields (name/position/email/password) are
+	// always collected regardless of these flags.
+	//
+	// Deliberately no `default:` gorm tag here: GORM silently omits a zero-valued field
+	// from INSERT whenever its tag declares a default, letting the column's DB-level
+	// default win instead — that would turn an explicit CollectDepartment: false back into
+	// true. The app always sets both fields explicitly on every insert, so no DB-level
+	// default is needed (the historical ADD COLUMN migration that needed one already ran).
+	CollectDepartment bool `gorm:"column:collect_department;not null" json:"-"`
+	CollectTenure     bool `gorm:"column:collect_tenure;not null" json:"-"`
 }
 
 func (Organization) TableName() string { return "organizations" }
@@ -100,9 +121,12 @@ func (Position) TableName() string { return "positions" }
 // the given schema (needed by the existing Settings screen) — everything else mirrors the
 // supplied users table exactly.
 type User struct {
-	ID           string  `gorm:"column:id;primaryKey;size:64" json:"id"`
-	OrgID        string  `gorm:"column:org_id;size:64;not null;index;uniqueIndex:uq_users_org_email,priority:1" json:"-"`
-	Email        string  `gorm:"column:email;size:255;not null;uniqueIndex:uq_users_org_email,priority:2" json:"email"`
+	ID    string `gorm:"column:id;primaryKey;size:64" json:"id"`
+	OrgID string `gorm:"column:org_id;size:64;not null;index" json:"-"`
+	// Email is globally unique (not per-org) so login can resolve org purely from email —
+	// no company picker needed. This means the same email cannot independently register at
+	// two different orgs; acceptable since these represent distinct real people in practice.
+	Email        string  `gorm:"column:email;size:255;not null;uniqueIndex:uq_users_email" json:"email"`
 	PasswordHash string  `gorm:"column:password_hash;size:255;not null" json:"-"`
 	Role         Role    `gorm:"column:role;type:user_role;not null;default:employee;index" json:"role"`
 	DepartmentID *string `gorm:"column:department_id;size:64;index" json:"-"`
@@ -113,6 +137,9 @@ type User struct {
 	LastLoginAt          time.Time `gorm:"column:last_login_at" json:"lastLoginAt"`
 	NotifyNewRound       bool      `gorm:"column:notify_new_round;default:true" json:"notifyNewRound"`
 	NotifyMonthlySummary bool      `gorm:"column:notify_monthly_summary;default:true" json:"notifyMonthlySummary"`
+	// TenureBucket is set only when the org's CollectTenure toggle was on at registration
+	// time; nil for seeded/legacy users and for orgs that don't collect it.
+	TenureBucket *string `gorm:"column:tenure_bucket;type:tenure_bucket" json:"-"`
 
 	CreatedAt time.Time `gorm:"column:created_at" json:"-"`
 	UpdatedAt time.Time `gorm:"column:updated_at" json:"-"`
@@ -139,6 +166,14 @@ type SurveyPeriod struct {
 	Year     int16     `gorm:"column:year;not null;check:year BETWEEN 2000 AND 2100;uniqueIndex:uq_survey_periods_org_month_year,priority:3" json:"year"`
 	OpensAt  time.Time `gorm:"column:opens_at;not null" json:"opensAt"`
 	ClosesAt time.Time `gorm:"column:closes_at;not null;check:closes_at > opens_at" json:"closesAt"`
+
+	// EnabledExtraQuestions is a subset of dto.ExtraQuestionCatalog's keys — the fixed,
+	// optional questions HR chose to turn on for this specific round, on top of the
+	// always-present satisfaction score + comment. No `default:` gorm tag (deliberately —
+	// see the GORM zero-value footgun documented in WIKI-Backend.md section 13): a nil/empty
+	// slice here is a real, meaningful value ("no extra questions this round"), not a
+	// placeholder to fall back away from.
+	EnabledExtraQuestions []string `gorm:"column:enabled_extra_questions;serializer:json" json:"-"`
 
 	CreatedAt time.Time `gorm:"column:created_at" json:"-"`
 }
@@ -197,6 +232,18 @@ type ResponseAnalysis struct {
 }
 
 func (ResponseAnalysis) TableName() string { return "response_analysis" }
+
+// ExtraAnswer stores one answer to one of the fixed, optional questions in
+// dto.ExtraQuestionCatalog, attached to a SurveyResponse. Same anonymity guarantee as
+// SurveyResponse itself: only a response id, never a user id.
+type ExtraAnswer struct {
+	ID          string `gorm:"column:id;primaryKey;size:64" json:"id"`
+	ResponseID  string `gorm:"column:response_id;size:64;not null;index" json:"-"`
+	QuestionKey string `gorm:"column:question_key;size:32;not null;index" json:"-"`
+	Value       int16  `gorm:"column:value;not null" json:"-"`
+}
+
+func (ExtraAnswer) TableName() string { return "extra_answers" }
 
 // DashboardMetrics/PositionScore/KeywordMonthly exist for schema fidelity with the supplied
 // SQL, but this pass computes everything live via analytics queries (same architecture as
@@ -258,16 +305,16 @@ const (
 )
 
 type Alert struct {
-	ID                   string        `gorm:"column:id;primaryKey;size:64" json:"id"`
-	OrgID                string        `gorm:"column:org_id;size:64;not null;index" json:"-"`
-	PeriodID             string        `gorm:"column:period_id;size:64;not null;index" json:"-"`
-	AlertType            AlertType     `gorm:"column:alert_type;type:alert_type;not null" json:"alertType"`
-	Severity             AlertSeverity `gorm:"column:severity;type:alert_severity;not null;default:warning" json:"severity"`
-	Message              string        `gorm:"column:message;type:text;not null" json:"message"`
-	RelatedDepartmentID  *string       `gorm:"column:related_department_id;size:64" json:"relatedDepartmentId,omitempty"`
-	RelatedPositionID    *string       `gorm:"column:related_position_id;size:64" json:"relatedPositionId,omitempty"`
-	CreatedAt            time.Time     `gorm:"column:created_at" json:"createdAt"`
-	ResolvedAt           *time.Time    `gorm:"column:resolved_at" json:"resolvedAt,omitempty"`
+	ID                  string        `gorm:"column:id;primaryKey;size:64" json:"id"`
+	OrgID               string        `gorm:"column:org_id;size:64;not null;index" json:"-"`
+	PeriodID            string        `gorm:"column:period_id;size:64;not null;index" json:"-"`
+	AlertType           AlertType     `gorm:"column:alert_type;type:alert_type;not null" json:"alertType"`
+	Severity            AlertSeverity `gorm:"column:severity;type:alert_severity;not null;default:warning" json:"severity"`
+	Message             string        `gorm:"column:message;type:text;not null" json:"message"`
+	RelatedDepartmentID *string       `gorm:"column:related_department_id;size:64" json:"relatedDepartmentId,omitempty"`
+	RelatedPositionID   *string       `gorm:"column:related_position_id;size:64" json:"relatedPositionId,omitempty"`
+	CreatedAt           time.Time     `gorm:"column:created_at" json:"createdAt"`
+	ResolvedAt          *time.Time    `gorm:"column:resolved_at" json:"resolvedAt,omitempty"`
 }
 
 func (Alert) TableName() string { return "alerts" }
@@ -417,7 +464,7 @@ func AllModels() []any {
 		&Topic{},
 		&SurveyPeriod{},
 		&SurveySubmission{}, &SurveyResponse{},
-		&ResponseAnalysis{},
+		&ResponseAnalysis{}, &ExtraAnswer{},
 		&DashboardMetrics{}, &PositionScore{}, &KeywordMonthly{},
 		&Alert{}, &KnowledgeBaseSummary{},
 		&FeedPost{}, &FeedVote{},

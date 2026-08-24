@@ -22,6 +22,7 @@ var (
 
 type Claims struct {
 	UserID string      `json:"sub"`
+	OrgID  string      `json:"org"`
 	Role   models.Role `json:"role"`
 	Type   string      `json:"typ"` // "access"
 	jwt.RegisteredClaims
@@ -39,11 +40,12 @@ func NewIssuer(secret string, accessTTL, refreshTTL time.Duration) *Issuer {
 
 func (i *Issuer) RefreshTTL() time.Duration { return i.refreshTTL }
 
-// AccessToken signs a short-lived token carrying the user's id and role.
-func (i *Issuer) AccessToken(userID string, role models.Role) (string, time.Time, error) {
+// AccessToken signs a short-lived token carrying the user's id, org and role.
+func (i *Issuer) AccessToken(userID, orgID string, role models.Role) (string, time.Time, error) {
 	expiry := time.Now().Add(i.accessTTL)
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, Claims{
 		UserID: userID,
+		OrgID:  orgID,
 		Role:   role,
 		Type:   "access",
 		RegisteredClaims: jwt.RegisteredClaims{
@@ -110,4 +112,23 @@ func AnonymousToken() (string, error) {
 func VoterHash(secret, userID, postID string) string {
 	sum := sha256.Sum256([]byte(secret + "|" + userID + "|" + postID))
 	return hex.EncodeToString(sum[:])[:64]
+}
+
+// joinCodeCharset excludes visually ambiguous characters (0/O, 1/I/L) since a join code is
+// read aloud or copied off a printout by hand, not pasted from a password manager.
+const joinCodeCharset = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+// JoinCode generates a 6-character, case-insensitive-by-convention (always produced
+// uppercase) join code. Collision handling is the caller's responsibility via a DB unique
+// constraint + retry loop — this function has no knowledge of existing codes.
+func JoinCode() (string, error) {
+	raw := make([]byte, 6)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generating join code: %w", err)
+	}
+	out := make([]byte, 6)
+	for i, b := range raw {
+		out[i] = joinCodeCharset[int(b)%len(joinCodeCharset)]
+	}
+	return string(out), nil
 }

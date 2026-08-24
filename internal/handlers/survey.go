@@ -18,17 +18,16 @@ import (
 type SurveyHandler struct {
 	db    *gorm.DB
 	stats *analytics.Service
-	orgID string
 }
 
-func NewSurveyHandler(db *gorm.DB, stats *analytics.Service, orgID string) *SurveyHandler {
-	return &SurveyHandler{db: db, stats: stats, orgID: orgID}
+func NewSurveyHandler(db *gorm.DB, stats *analytics.Service) *SurveyHandler {
+	return &SurveyHandler{db: db, stats: stats}
 }
 
 // Current returns the currently open survey period, if any, and whether the caller already
 // submitted it this period.
 func (h *SurveyHandler) Current(c *fiber.Ctx) error {
-	period, err := h.stats.CurrentOpenPeriod()
+	period, err := h.stats.WithOrg(middleware.OrgID(c)).CurrentOpenPeriod()
 	if err != nil {
 		return err
 	}
@@ -47,6 +46,13 @@ func (h *SurveyHandler) Current(c *fiber.Ctx) error {
 	return c.JSON(dto.NewSurveyPeriod(period, submitted > 0, 0))
 }
 
+// Catalog returns the fixed set of optional extra questions HR can toggle on/off per round
+// (see dto.ExtraQuestionCatalog) — static, no DB access, available to any authenticated role
+// since both HR (choosing what to enable) and employees (rendering enabled questions) need it.
+func (h *SurveyHandler) Catalog(c *fiber.Ctx) error {
+	return c.JSON(dto.ExtraQuestionCatalog)
+}
+
 // Submit stores a response with no link back to the caller.
 //
 // The user id is used for exactly two things, both outside the response itself: reading the
@@ -56,6 +62,7 @@ func (h *SurveyHandler) Current(c *fiber.Ctx) error {
 // submission record can never exist for a response that failed to save (or vice versa).
 func (h *SurveyHandler) Submit(c *fiber.Ctx) error {
 	userID := middleware.UserID(c)
+	orgID := middleware.OrgID(c)
 
 	var req dto.SubmitResponseRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -65,7 +72,7 @@ func (h *SurveyHandler) Submit(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(dto.ValidationErrors{Errors: problems})
 	}
 
-	period, err := h.stats.CurrentOpenPeriod()
+	period, err := h.stats.WithOrg(orgID).CurrentOpenPeriod()
 	if err != nil {
 		return err
 	}
@@ -92,12 +99,12 @@ func (h *SurveyHandler) Submit(c *fiber.Ctx) error {
 	now := time.Now()
 	response := models.SurveyResponse{
 		ID:                uuid.NewString(),
-		OrgID:              h.orgID,
-		PeriodID:           period.ID,
-		DepartmentID:       user.DepartmentID,
-		PositionID:         user.PositionID,
-		SatisfactionScore:  int16(req.SatisfactionScore),
-		SubmittedAt:        now,
+		OrgID:             orgID,
+		PeriodID:          period.ID,
+		DepartmentID:      user.DepartmentID,
+		PositionID:        user.PositionID,
+		SatisfactionScore: int16(req.SatisfactionScore),
+		SubmittedAt:       now,
 	}
 
 	var analysis *models.ResponseAnalysis
@@ -134,7 +141,7 @@ func (h *SurveyHandler) Submit(c *fiber.Ctx) error {
 				}
 				feedPost = &models.FeedPost{
 					ID:        uuid.NewString(),
-					OrgID:     h.orgID,
+					OrgID:     orgID,
 					Text:      redacted,
 					Hashtags:  tags,
 					PostedOn:  now.Format("2006-01-02"),
@@ -143,6 +150,27 @@ func (h *SurveyHandler) Submit(c *fiber.Ctx) error {
 				}
 			}
 		}
+	}
+
+	// Only answers to questions this specific period actually enabled are kept — a stale
+	// client sending answers for a question HR turned off (or never turned on) is silently
+	// dropped rather than rejected, since the enabled set can legitimately change between
+	// when the employee opened the form and when they submit it.
+	enabledExtra := make(map[string]bool, len(period.EnabledExtraQuestions))
+	for _, k := range period.EnabledExtraQuestions {
+		enabledExtra[k] = true
+	}
+	var extraAnswers []models.ExtraAnswer
+	for key, value := range req.ExtraAnswers {
+		if !enabledExtra[key] {
+			continue
+		}
+		extraAnswers = append(extraAnswers, models.ExtraAnswer{
+			ID:          uuid.NewString(),
+			ResponseID:  response.ID,
+			QuestionKey: key,
+			Value:       int16(value),
+		})
 	}
 
 	err = h.db.Transaction(func(tx *gorm.DB) error {
@@ -159,9 +187,14 @@ func (h *SurveyHandler) Submit(c *fiber.Ctx) error {
 				return err
 			}
 		}
+		if len(extraAnswers) > 0 {
+			if err := tx.Create(&extraAnswers).Error; err != nil {
+				return err
+			}
+		}
 		return tx.Create(&models.SurveySubmission{
 			ID:          uuid.NewString(),
-			OrgID:       h.orgID,
+			OrgID:       orgID,
 			UserID:      userID,
 			PeriodID:    period.ID,
 			SubmittedAt: now,

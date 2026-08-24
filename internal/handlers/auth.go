@@ -17,11 +17,10 @@ import (
 type AuthHandler struct {
 	db     *gorm.DB
 	issuer *auth.Issuer
-	orgID  string
 }
 
-func NewAuthHandler(db *gorm.DB, issuer *auth.Issuer, orgID string) *AuthHandler {
-	return &AuthHandler{db: db, issuer: issuer, orgID: orgID}
+func NewAuthHandler(db *gorm.DB, issuer *auth.Issuer) *AuthHandler {
+	return &AuthHandler{db: db, issuer: issuer}
 }
 
 // Login verifies credentials and mints the token pair. The role comes from the database
@@ -38,7 +37,7 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 	}
 
 	var user models.User
-	err := h.db.Where("org_id = ? AND email = ?", h.orgID, req.Email).First(&user).Error
+	err := h.db.Where("email = ?", req.Email).First(&user).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		// Same message and roughly the same work either way, so the response cannot be
 		// used to discover which addresses have accounts.
@@ -114,51 +113,62 @@ func (h *AuthHandler) Logout(c *fiber.Ctx) error {
 }
 
 func (h *AuthHandler) issuePair(c *fiber.Ctx, user *models.User) error {
-	access, expiresAt, err := h.issuer.AccessToken(user.ID, user.Role)
+	resp, err := issueTokenPair(h.db, h.issuer, user)
 	if err != nil {
 		return err
 	}
-	refresh, hash, refreshExpiry, err := h.issuer.RefreshToken()
+	return c.JSON(resp)
+}
+
+// issueTokenPair mints an access+refresh token pair for user and resolves their department/
+// position display names — shared by AuthHandler (login/refresh) and OnboardingHandler
+// (signup/employee registration) so token issuance has exactly one implementation.
+func issueTokenPair(db *gorm.DB, issuer *auth.Issuer, user *models.User) (dto.AuthResponse, error) {
+	access, expiresAt, err := issuer.AccessToken(user.ID, user.OrgID, user.Role)
 	if err != nil {
-		return err
+		return dto.AuthResponse{}, err
 	}
-	err = h.db.Create(&models.RefreshToken{
+	refresh, hash, refreshExpiry, err := issuer.RefreshToken()
+	if err != nil {
+		return dto.AuthResponse{}, err
+	}
+	err = db.Create(&models.RefreshToken{
 		UserID:    user.ID,
 		TokenHash: hash,
 		ExpiresAt: refreshExpiry,
 	}).Error
 	if err != nil {
-		return err
+		return dto.AuthResponse{}, err
 	}
 
-	deptName := h.departmentName(user.DepartmentID)
-	posName := h.positionName(user.PositionID)
+	deptName := departmentName(db, user.DepartmentID)
+	posName := positionName(db, user.PositionID)
 
-	return c.JSON(dto.AuthResponse{
+	return dto.AuthResponse{
 		AccessToken:  access,
 		RefreshToken: refresh,
 		ExpiresAt:    expiresAt,
 		User:         dto.NewUser(user, deptName, posName),
-	})
+	}, nil
 }
 
-func (h *AuthHandler) departmentName(departmentID *string) string {
+func departmentName(db *gorm.DB, departmentID *string) string {
 	if departmentID == nil {
 		return ""
 	}
 	var department models.Department
-	if h.db.First(&department, "id = ?", *departmentID).Error != nil {
+	if db.First(&department, "id = ?", *departmentID).Error != nil {
 		return ""
 	}
 	return department.Name
 }
 
-func (h *AuthHandler) positionName(positionID *string) string {
+func positionName(db *gorm.DB, positionID *string) string {
 	if positionID == nil {
 		return ""
 	}
 	var position models.Position
-	if h.db.First(&position, "id = ?", *positionID).Error != nil {
+	if db.First(&position, "id = ?", *positionID).Error != nil {
 		return ""
 	}
 	return position.Name
@@ -170,7 +180,7 @@ func (h *AuthHandler) Me(c *fiber.Ctx) error {
 	if err := h.db.First(&user, "id = ?", middleware.UserID(c)).Error; err != nil {
 		return fiber.NewError(fiber.StatusNotFound, "user not found")
 	}
-	return c.JSON(dto.NewUser(&user, h.departmentName(user.DepartmentID), h.positionName(user.PositionID)))
+	return c.JSON(dto.NewUser(&user, departmentName(h.db, user.DepartmentID), positionName(h.db, user.PositionID)))
 }
 
 // UpdateMe changes the caller's own notification preferences and nothing else.
@@ -196,7 +206,7 @@ func (h *AuthHandler) UpdateMe(c *fiber.Ctx) error {
 // they answered. It reads survey_submissions, which shares no key with survey_responses.
 func (h *AuthHandler) SubmissionHistory(c *fiber.Ctx) error {
 	var periods []models.SurveyPeriod
-	if err := h.db.Where("org_id = ?", h.orgID).Order("year DESC, month DESC").Find(&periods).Error; err != nil {
+	if err := h.db.Where("org_id = ?", middleware.OrgID(c)).Order("year DESC, month DESC").Find(&periods).Error; err != nil {
 		return err
 	}
 

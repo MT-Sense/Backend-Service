@@ -31,7 +31,16 @@ type Service struct {
 	orgID string
 }
 
-func New(db *gorm.DB, orgID string) *Service { return &Service{db: db, orgID: orgID} }
+func New(db *gorm.DB) *Service { return &Service{db: db} }
+
+// WithOrg returns a copy of the service scoped to a specific org — the per-request
+// replacement for the old boot-time constant. Cheap value-copy, safe to call once per
+// request from a shared *Service without any locking.
+func (s *Service) WithOrg(orgID string) *Service {
+	clone := *s
+	clone.orgID = orgID
+	return &clone
+}
 
 func periodLabel(p models.SurveyPeriod) string {
 	return fmt.Sprintf("%04d-%02d", p.Year, p.Month)
@@ -135,6 +144,38 @@ func (s *Service) TotalRespondents(periodID string) (int64, error) {
 	var n int64
 	err := s.db.Model(&models.SurveyResponse{}).Where("period_id = ?", periodID).Count(&n).Error
 	return n, err
+}
+
+// ExtraQuestionStat is one fixed-catalog extra question's company-wide average for a period.
+type ExtraQuestionStat struct {
+	Key   string
+	Avg   float64
+	Count int64
+}
+
+// ExtraQuestionResults aggregates answers to the optional extra questions (see
+// dto.ExtraQuestionCatalog) HR enabled for a period. extra_answers has no period_id column
+// of its own — it joins through survey_responses, the same table that owns period scoping.
+func (s *Service) ExtraQuestionResults(periodID string) ([]ExtraQuestionStat, error) {
+	var rows []struct {
+		Key   string
+		Avg   float64
+		Count int64
+	}
+	err := s.db.Table("extra_answers").
+		Joins("JOIN survey_responses ON survey_responses.id = extra_answers.response_id").
+		Where("survey_responses.period_id = ?", periodID).
+		Group("extra_answers.question_key").
+		Select("extra_answers.question_key AS key, AVG(extra_answers.value) AS avg, COUNT(*) AS count").
+		Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ExtraQuestionStat, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, ExtraQuestionStat{Key: r.Key, Avg: round(r.Avg, 2), Count: r.Count})
+	}
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -390,7 +431,7 @@ func (s *Service) Radar(period *models.SurveyPeriod, topics []models.Topic) ([]R
 }
 
 type DepartmentScore struct {
-	DepartmentID string                        `json:"departmentId"`
+	DepartmentID string                       `json:"departmentId"`
 	Score        models.Suppressible[float64] `json:"score"`
 }
 
@@ -497,10 +538,10 @@ func (s *Service) OverallHealthScore(periodID string) (int, error) {
 // ---------------------------------------------------------------------------
 
 type TopicStats struct {
-	Score             float64
-	CompanyAverage    float64
-	RespondentCount   int64
-	PercentageTagged  int
+	Score            float64
+	CompanyAverage   float64
+	RespondentCount  int64
+	PercentageTagged int
 }
 
 func (s *Service) TopicStats(periodID, topicID string) (TopicStats, error) {
