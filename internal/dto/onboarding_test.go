@@ -84,18 +84,18 @@ func TestEmployeeRegisterRequestBaselineValidation(t *testing.T) {
 	}
 
 	valid := EmployeeRegisterRequest{
-		Code:      "ABC123",
-		FirstName: "Somchai",
-		LastName:  "Test",
-		Position:  "Engineer",
-		Email:     "somchai@acme.test",
-		Password:  "supersecret1",
+		Code:         "ABC123",
+		DepartmentID: "dept-1",
+		FirstName:    "Somchai",
+		LastName:     "Test",
+		Position:     "Engineer",
+		Email:        "somchai@acme.test",
+		Password:     "supersecret1",
 	}
 	if problems := valid.Validate(); len(problems) > 0 {
 		t.Errorf("valid register request rejected: %v", problems)
 	}
-	// Department/tenure conditional-required checks happen in the handler (they need the
-	// org's toggles from the DB), not here — Validate() only checks baseline shape.
+	// Department ownership and tenure checks happen in the handler after resolving the company.
 }
 
 func TestIsValidTenureBucket(t *testing.T) {
@@ -106,5 +106,18 @@ func TestIsValidTenureBucket(t *testing.T) {
 	}
 	if IsValidTenureBucket("10y") {
 		t.Error("unknown bucket accepted")
+	}
+}
+
+func TestJoinCodeNormalizesBeforeRegistration(t *testing.T) {
+	check := JoinCodeCheckRequest{Code: " demo01 "}
+	check.Normalize()
+	if check.Code != "DEMO01" || len(check.Validate()) != 0 {
+		t.Fatalf("unexpected join check request: %+v", check)
+	}
+	register := EmployeeRegisterRequest{Code: " demo01 ", DepartmentID: " dept-1 "}
+	register.Normalize()
+	if register.Code != "DEMO01" || register.DepartmentID != "dept-1" {
+		t.Fatalf("unexpected register request normalization: %+v", register)
 	}
 }

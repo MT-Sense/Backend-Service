@@ -17,8 +17,7 @@ import (
 )
 
 // OnboardingHandler implements self-service company signup and employee join-by-code.
-// Unlike the other handlers it never carries an org id at all — every method here either
-// creates the org (Signup) or resolves it fresh from a join code / the caller's JWT.
+// Employee registration resolves the company through its join code.
 type OnboardingHandler struct {
 	db     *gorm.DB
 	issuer *auth.Issuer
@@ -69,10 +68,7 @@ func (h *OnboardingHandler) Signup(c *fiber.Ctx) error {
 			ID:   uuid.NewString(),
 			Name: req.CompanyName,
 			Slug: slug,
-			// CollectDepartment starts off: a brand-new org has zero departments (there is
-			// no department-management UI yet — see WIKI-Backend.md), so defaulting this on
-			// would show joining employees an empty, unusable dropdown. HR can turn it on
-			// from Settings once departments exist for the org.
+			// New organizations have no departments yet. HR creates them after signup.
 			JoinCode:          code,
 			CollectDepartment: false,
 			CollectTenure:     false,
@@ -127,10 +123,8 @@ func (h *OnboardingHandler) Signup(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(dto.SignupResponse{AuthResponse: resp, JoinCode: org.JoinCode})
 }
 
-// CheckJoinCode is the public pre-check a joining employee hits first: does this code
-// resolve to a company, and does the form need a company password / department / tenure
-// field. Rate-limited at the router (router.go) — this is the guessing surface for the
-// 6-char code.
+// CheckJoinCode resolves the organization code and lists its departments.
+// The public route is rate-limited at the router.
 func (h *OnboardingHandler) CheckJoinCode(c *fiber.Ctx) error {
 	var req dto.JoinCodeCheckRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -145,26 +139,21 @@ func (h *OnboardingHandler) CheckJoinCode(c *fiber.Ctx) error {
 	if err := h.db.Where("join_code = ?", req.Code).First(&org).Error; err != nil {
 		return c.JSON(dto.JoinCodeCheckResponse{Valid: false})
 	}
-
-	var departmentOptions []dto.JoinCodeOption
-	if org.CollectDepartment {
-		var departments []models.Department
-		if err := h.db.Where("org_id = ?", org.ID).Order("name").Find(&departments).Error; err != nil {
-			return err
-		}
-		departmentOptions = make([]dto.JoinCodeOption, 0, len(departments))
-		for _, d := range departments {
-			departmentOptions = append(departmentOptions, dto.JoinCodeOption{ID: d.ID, Name: d.Name})
-		}
+	var departments []models.Department
+	if err := h.db.Where("org_id = ?", org.ID).Order("name").Find(&departments).Error; err != nil {
+		return err
+	}
+	options := make([]dto.JoinCodeOption, 0, len(departments))
+	for _, department := range departments {
+		options = append(options, dto.JoinCodeOption{ID: department.ID, Name: department.Name})
 	}
 
 	return c.JSON(dto.JoinCodeCheckResponse{
 		Valid:                   true,
 		CompanyName:             org.Name,
+		Departments:             options,
 		RequiresCompanyPassword: org.CompanyPasswordHash != nil,
-		CollectDepartment:       org.CollectDepartment,
 		CollectTenure:           org.CollectTenure,
-		Departments:             departmentOptions,
 	})
 }
 
@@ -197,7 +186,7 @@ func (h *OnboardingHandler) CheckCompanyPassword(c *fiber.Ctx) error {
 	return c.JSON(dto.CompanyPasswordCheckResponse{Valid: valid})
 }
 
-// RegisterEmployee creates an employee account under the org identified by the join code.
+// RegisterEmployee creates an employee account under the org identified by its join code.
 // Re-verifies the company password (if set) and re-resolves org toggles here rather than
 // trusting the earlier check calls, since those were UX pre-validation, not a session.
 func (h *OnboardingHandler) RegisterEmployee(c *fiber.Ctx) error {
@@ -226,18 +215,11 @@ func (h *OnboardingHandler) RegisterEmployee(c *fiber.Ctx) error {
 	}
 
 	var problems []string
-	var departmentID *string
-	if org.CollectDepartment {
-		if req.DepartmentID == nil || *req.DepartmentID == "" {
-			problems = append(problems, "departmentId is required")
-		} else {
-			var dept models.Department
-			if err := h.db.Where("id = ? AND org_id = ?", *req.DepartmentID, org.ID).First(&dept).Error; err != nil {
-				problems = append(problems, "departmentId is not a department of this organization")
-			} else {
-				departmentID = &dept.ID
-			}
-		}
+	var department models.Department
+	if err := h.db.Where("id = ? AND org_id = ?", req.DepartmentID, org.ID).First(&department).Error; errors.Is(err, gorm.ErrRecordNotFound) {
+		problems = append(problems, "departmentId must be a department of this organization")
+	} else if err != nil {
+		return err
 	}
 	var tenureBucket *string
 	if org.CollectTenure {
@@ -275,7 +257,7 @@ func (h *OnboardingHandler) RegisterEmployee(c *fiber.Ctx) error {
 		Email:        req.Email,
 		PasswordHash: string(passwordHash),
 		Role:         models.RoleEmployee,
-		DepartmentID: departmentID,
+		DepartmentID: &department.ID,
 		PositionID:   &position.ID,
 		IsActive:     true,
 		FullName:     fmt.Sprintf("%s %s", req.FirstName, req.LastName),
@@ -295,9 +277,7 @@ func (h *OnboardingHandler) RegisterEmployee(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(resp)
 }
 
-// GetJoinCode / RegenerateJoinCode / GetOrgSettings / UpdateOrgSettings are admin-only,
-// authenticated — org comes from the caller's JWT via middleware.OrgID, same as every other
-// admin-only handler in this codebase.
+// Organization settings are admin-only; the org comes from the caller's JWT.
 
 func (h *OnboardingHandler) GetJoinCode(c *fiber.Ctx) error {
 	var org models.Organization
@@ -356,6 +336,15 @@ func (h *OnboardingHandler) UpdateOrgSettings(c *fiber.Ctx) error {
 		}
 	}
 	if req.CollectDepartment != nil {
+		if !*req.CollectDepartment {
+			var count int64
+			if err := h.db.Model(&models.Department{}).Where("org_id = ?", middleware.OrgID(c)).Count(&count).Error; err != nil {
+				return err
+			}
+			if count > 0 {
+				return fiber.NewError(fiber.StatusBadRequest, "departments cannot be disabled while departments exist")
+			}
+		}
 		updates["collect_department"] = *req.CollectDepartment
 	}
 	if req.CollectTenure != nil {

@@ -113,14 +113,13 @@ func slugify(name string) string {
 	return strings.Trim(b.String(), "-")
 }
 
-// SignupResponse carries the new HR admin's session (same shape as login) plus the
-// company's join code, shown inline once so the UI doesn't need a second round trip.
+// SignupResponse carries the new HR admin's session and company join code.
 type SignupResponse struct {
 	AuthResponse
 	JoinCode string `json:"joinCode"`
 }
 
-// --- join code check (public, pre-registration) ---
+// --- company join code check (public, pre-registration) ---
 
 type JoinCodeCheckRequest struct {
 	Code string `json:"code"`
@@ -137,8 +136,7 @@ func (r *JoinCodeCheckRequest) Validate() []string {
 	return nil
 }
 
-// JoinCodeOption is a minimal, public-safe department reference — just enough for the
-// registration form's dropdown, no respondent counts or anything else org-internal.
+// JoinCodeOption is a department choice shown during registration.
 type JoinCodeOption struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
@@ -147,10 +145,9 @@ type JoinCodeOption struct {
 type JoinCodeCheckResponse struct {
 	Valid                   bool             `json:"valid"`
 	CompanyName             string           `json:"companyName,omitempty"`
+	Departments             []JoinCodeOption `json:"departments"`
 	RequiresCompanyPassword bool             `json:"requiresCompanyPassword"`
-	CollectDepartment       bool             `json:"collectDepartment"`
 	CollectTenure           bool             `json:"collectTenure"`
-	Departments             []JoinCodeOption `json:"departments,omitempty"`
 }
 
 // --- company password check (public, pre-registration) ---
@@ -189,7 +186,7 @@ type EmployeeRegisterRequest struct {
 	Position        string  `json:"position"`
 	Email           string  `json:"email"`
 	Password        string  `json:"password"`
-	DepartmentID    *string `json:"departmentId"`
+	DepartmentID    string  `json:"departmentId"`
 	TenureBucket    *string `json:"tenureBucket"`
 }
 
@@ -199,11 +196,10 @@ func (r *EmployeeRegisterRequest) Normalize() {
 	r.LastName = strings.TrimSpace(r.LastName)
 	r.Position = strings.TrimSpace(r.Position)
 	r.Email = strings.TrimSpace(strings.ToLower(r.Email))
+	r.DepartmentID = strings.TrimSpace(r.DepartmentID)
 }
 
-// Validate checks baseline shape only. Whether DepartmentID/TenureBucket are required
-// depends on the org's CollectDepartment/CollectTenure toggles, which requires a DB lookup —
-// that conditional check happens in the handler, after the org has been resolved.
+// Validate checks baseline shape only. Tenure depends on the resolved organization.
 func (r *EmployeeRegisterRequest) Validate() []string {
 	var problems []string
 	if r.Code == "" {
@@ -225,6 +221,9 @@ func (r *EmployeeRegisterRequest) Validate() []string {
 	}
 	if len(r.Password) < 8 {
 		problems = append(problems, "password must be at least 8 characters")
+	}
+	if r.DepartmentID == "" {
+		problems = append(problems, "departmentId is required")
 	}
 	return problems
 }
