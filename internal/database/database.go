@@ -1,10 +1,12 @@
 package database
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -137,6 +139,9 @@ func Migrate(db *gorm.DB) error {
 	if err := backfillJoinCodes(db); err != nil {
 		return fmt.Errorf("backfilling join codes: %w", err)
 	}
+	if err := backfillDepartmentCodes(db); err != nil {
+		return fmt.Errorf("backfilling department codes: %w", err)
+	}
 	if err := installTriggers(db); err != nil {
 		return fmt.Errorf("installing triggers: %w", err)
 	}
@@ -144,7 +149,37 @@ func Migrate(db *gorm.DB) error {
 	return nil
 }
 
-// backfillJoinCodes assigns a real join code to any organization left with the '' the
+func backfillDepartmentCodes(db *gorm.DB) error {
+	var departments []models.Department
+	if err := db.Where("join_code IS NULL OR join_code = ''").Find(&departments).Error; err != nil {
+		return err
+	}
+	for _, department := range departments {
+		for attempt := 0; attempt < 5; attempt++ {
+			code, err := auth.DepartmentCode()
+			if err != nil {
+				return err
+			}
+			err = db.Model(&models.Department{}).Where("id = ?", department.ID).Update("join_code", code).Error
+			if err == nil {
+				break
+			}
+			if !isUniqueDepartmentCodeError(err) || attempt == 4 {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func isUniqueDepartmentCodeError(err error) bool {
+	// The code is random and protected by the unique index. A collision is rare;
+	// retrying on any unique violation is safe here because only join_code changes.
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+// backfillJoinCodes assigns a real join code to any organization left with the ” the
 // JoinCode column's migration default produced (see the field's doc comment in models.go) —
 // rows that existed before this column was added. The demo org gets the fixed "DEMO01" to
 // match seed.go's convention; anything else gets a freshly generated code.

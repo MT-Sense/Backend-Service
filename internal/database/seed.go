@@ -10,6 +10,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 
+	"github.com/mt-sense/backend-service/internal/auth"
 	"github.com/mt-sense/backend-service/internal/models"
 )
 
@@ -121,7 +122,11 @@ var topicSeed = []struct {
 
 func seedReference(tx *gorm.DB, orgID string) error {
 	for _, d := range departmentSeed {
-		dept := models.Department{ID: d.ID, OrgID: orgID, Name: d.Name}
+		code, err := auth.DepartmentCode()
+		if err != nil {
+			return err
+		}
+		dept := models.Department{ID: d.ID, OrgID: orgID, Name: d.Name, JoinCode: &code}
 		if err := tx.Create(&dept).Error; err != nil {
 			return err
 		}

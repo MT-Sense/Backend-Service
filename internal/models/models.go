@@ -97,6 +97,7 @@ type Department struct {
 	ID        string    `gorm:"column:id;primaryKey;size:64" json:"id"`
 	OrgID     string    `gorm:"column:org_id;size:64;not null;index;uniqueIndex:uq_departments_org_name,priority:1" json:"-"`
 	Name      string    `gorm:"column:name;size:255;not null;uniqueIndex:uq_departments_org_name,priority:2" json:"name"`
+	JoinCode  *string   `gorm:"column:join_code;size:8;uniqueIndex:uq_departments_join_code" json:"-"`
 	CreatedAt time.Time `gorm:"column:created_at" json:"-"`
 	UpdatedAt time.Time `gorm:"column:updated_at" json:"-"`
 

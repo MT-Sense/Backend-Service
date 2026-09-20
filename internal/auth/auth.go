@@ -132,3 +132,16 @@ func JoinCode() (string, error) {
 	}
 	return string(out), nil
 }
+
+// DepartmentCode generates a legacy department code retained for existing records.
+func DepartmentCode() (string, error) {
+	raw := make([]byte, 8)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generating department code: %w", err)
+	}
+	out := make([]byte, len(raw))
+	for i, b := range raw {
+		out[i] = joinCodeCharset[int(b)%len(joinCodeCharset)]
+	}
+	return string(out), nil
+}

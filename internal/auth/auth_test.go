@@ -37,3 +37,25 @@ func TestJoinCodeVariesAcrossCalls(t *testing.T) {
 		t.Errorf("only %d unique codes out of 20 calls — suspiciously low entropy", len(seen))
 	}
 }
+
+func TestDepartmentCodeLengthAndCharset(t *testing.T) {
+	code, err := DepartmentCode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(code) != 8 {
+		t.Fatalf("department code length = %d, want 8", len(code))
+	}
+	for _, r := range code {
+		found := false
+		for _, allowed := range joinCodeCharset {
+			if r == allowed {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("department code %q contains invalid character %q", code, r)
+		}
+	}
+}
