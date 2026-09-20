@@ -39,6 +39,13 @@ openssl rand -base64 48
 go run ./cmd/server
 ```
 
+ข้อความในแบบสำรวจถูกส่งไปวิเคราะห์ที่ AI-Service ก่อนบันทึกคำตอบ เริ่ม AI-Service
+ที่ `http://127.0.0.1:8000` ก่อน (ดู `../AI-Service/README.md`) หรือกำหนด
+`AI_SERVICE_URL` ใน `.env` ของ Backend หากใช้พอร์ตอื่น Backend ส่งเฉพาะข้อความที่
+ลบข้อมูลระบุตัวตนแล้ว และบันทึก sentiment, confidence, หมวดหัวข้อ และเหตุผลจาก AI-Service
+ลง `response_analysis` ถ้า AI-Service ไม่พร้อม การส่งคำตอบที่มีข้อความจะตอบ 503
+และไม่บันทึกคำตอบ; คำตอบที่ไม่มีข้อความยังส่งได้
+
 ครั้งแรกจะ migrate + seed ข้อมูลตัวอย่างให้อัตโนมัติ (1 องค์กร, แผนก/ตำแหน่ง, 6 รอบสำรวจ —
 5 รอบปิดแล้ว + 1 รอบเปิดอยู่ พร้อม response/analysis จริงทุกแถว)
 
@@ -116,10 +123,10 @@ API ปฏิเสธการ publish โพสต์ที่เจ้าข�
 
 Schema ที่กำหนดไม่มีคำถามแยกรายหัวข้อ (survey มีแค่ `satisfaction_score` + `comment_text`)
 ดังนั้นคะแนนต่อหัวข้อ (heatmap column, radar axis, topic drill-down) คำนวณจาก
-`response_analysis.categories` — แท็กหัวข้อที่ LLM/heuristic ให้กับ comment แต่ละอัน — โดยถือ
+`response_analysis.categories` — แท็กหัวข้อที่ AI-Service ให้กับ comment แต่ละอัน — โดยถือ
 ว่า "คะแนนของหัวข้อนี้ในแผนกนี้" = ค่าเฉลี่ย `satisfaction_score` ของคนที่ comment แตะหัวข้อนั้น
-เป็นการประมาณ ไม่ใช่ตัวเลขที่วัดตรง ๆ เหมือนแบบสอบถามเดิม — คอมเมนต์กำกับไว้ใน
-`internal/analytics/analytics.go`
+จึงเป็นการประมาณ ไม่ใช่ตัวเลขที่วัดตรง ๆ เหมือนแบบสอบถามเดิม Heatmap ขยายค่าจาก
+`response_analysis.categories` โดยตรง ไม่อ่าน `feed_posts.hashtags` (ดู `internal/analytics/analytics.go`)
 
 ---
 
@@ -156,6 +163,15 @@ Auth: `Authorization: Bearer <accessToken>` ทุก endpoint ยกเว้�
 | POST | `/api/survey-periods/:id/close` | ปิดรอบ + คำนวณ alerts |
 | GET | `/api/feed/pending` |
 | PATCH | `/api/feed/:id/moderate` |
+| GET/POST | `/api/hr/departments` | ดูรายชื่อและสร้าง Department ขององค์กร |
+| PATCH/DELETE | `/api/hr/departments/:id` | เปลี่ยนชื่อหรือลบ Department ที่ยังไม่มีข้อมูลอ้างอิง |
+
+HR เปิดหน้า `/departments` เพื่อสร้าง Department และใช้รหัส `organizations.join_code` จากหน้า Settings แจกพนักงาน
+พนักงานกรอกรหัสบริษัทที่หน้า `/join` จากนั้นเลือก Department ของบริษัทจาก dropdown ในหน้าสร้างบัญชี
+`POST /api/onboarding/join/check` ค้นหาบริษัทและรายชื่อ Department จากรหัสบริษัท
+`POST /api/onboarding/join/register` ตรวจรหัสบริษัทและยืนยันว่า `departmentId` อยู่ในบริษัทนั้นก่อนบันทึกบัญชี
+HR ต้องสร้าง Department อย่างน้อยหนึ่งรายการก่อนพนักงานจะสมัครได้
+HR เปลี่ยนชื่อ Department ได้จากหน้า `/departments`; การลบจะถูกปฏิเสธหากมีพนักงาน ผลแบบสอบถาม หรือข้อมูลย้อนหลังที่อ้างถึงแผนกนั้น
 
 ### Executive เท่านั้น
 `GET /api/dashboard/executive/summary`
@@ -223,9 +239,12 @@ dropdb mtsense && createdb mtsense && go run ./cmd/server
 
 ## ยังไม่ได้ทำ
 
-- **AI pipeline ของจริง** — sentiment/categories ตอนนี้เป็น keyword lookup, insight/urgent
-  issues/wordcloud/sub-issues มาจาก seed ทุกจุดมีคอมเมนต์ `ponytail:` กำกับไว้ว่าจะเปลี่ยนตรงไหน
-  คอลัมน์กับ aggregate ที่อ่านมันไม่ต้องแก้
+- **ข้อมูล AI บน Dashboard บางส่วน** — sentiment และ categories ของคำตอบใหม่มาจาก
+  AI-Service แล้ว ส่วน wordcloud แยกคำจากความคิดเห็นจริงผ่าน AI-Service และนับจำนวน
+  คำตอบที่พบคำนั้น (แสดงเฉพาะคำที่อยู่ในอย่างน้อย 5 คำตอบ) ไม่ใช้ข้อมูลตัวอย่างใน
+  `word_cloud_terms` อีกต่อไป ข้อความตัวอย่างในหน้า Topic ดึงจากคำตอบจริงที่ปกปิด
+  ข้อมูลส่วนตัวแล้วและแสดงเฉพาะกลุ่มที่มีอย่างน้อย 5 คำตอบ ส่วน insight/urgent issues/sub-issues ยังมาจาก seed
+  และคำตอบเก่าที่บันทึกก่อนเชื่อมต่อยังเป็นผลวิเคราะห์เดิม
 - **สูตร burnout risk** — ตอนนี้ใช้ heuristic (สัดส่วนคนที่ให้คะแนนรวม ≤2) เพราะสเปกยังไม่ได้สรุปสูตร
 - **`dashboard_metrics`/`position_scores`/`keywords_monthly`** — ตารางมีอยู่ตาม schema ที่กำหนด
   แต่ยังไม่มี batch job เขียนลงไป analytics ทั้งหมดยัง query สดเหมือนเดิม

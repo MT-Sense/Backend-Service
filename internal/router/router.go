@@ -7,6 +7,7 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/limiter"
 	"gorm.io/gorm"
 
+	"github.com/mt-sense/backend-service/internal/aiservice"
 	"github.com/mt-sense/backend-service/internal/analytics"
 	"github.com/mt-sense/backend-service/internal/auth"
 	"github.com/mt-sense/backend-service/internal/config"
@@ -42,13 +43,16 @@ func onboardingLimiter(max int, expiration time.Duration) fiber.Handler {
 func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) {
 	issuer := auth.NewIssuer(cfg.JWTSecret, cfg.AccessTTL, cfg.RefreshTTL)
 	stats := analytics.New(db)
+	ai := aiservice.New(cfg.AIServiceURL, 25*time.Second)
 
 	authH := handlers.NewAuthHandler(db, issuer)
-	dashH := handlers.NewDashboardHandler(db, stats)
-	surveyH := handlers.NewSurveyHandler(db, stats)
+	dashH := handlers.NewDashboardHandler(db, stats, ai)
+	surveyH := handlers.NewSurveyHandler(db, stats, ai)
+	trainingH := handlers.NewModelTrainingHandler(db, ai, cfg.AITrainingToken)
 	feedH := handlers.NewFeedHandler(db, cfg.JWTSecret)
 	periodsH := handlers.NewPeriodsHandler(db, stats)
 	onboardH := handlers.NewOnboardingHandler(db, issuer)
+	departmentsH := handlers.NewDepartmentsHandler(db)
 
 	adminOnly := middleware.RequireRole(models.RoleAdmin)
 	execOnly := middleware.RequireRole(models.RoleExecutive)
@@ -98,11 +102,17 @@ func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) {
 	// survey-period scheduling, and feed moderation.
 	r.Get("/dashboard/hr/kpi", adminOnly, dashH.HRKpis)
 	r.Get("/dashboard/hr/heatmap", adminOnly, dashH.Heatmap)
+	r.Get("/dashboard/hr/departments", adminOnly, dashH.DepartmentSummary)
 	r.Get("/dashboard/hr/wordcloud", adminOnly, dashH.WordCloud)
 	r.Get("/dashboard/hr/insight", adminOnly, dashH.Insight)
 	r.Get("/dashboard/hr/alerts", adminOnly, dashH.Alerts)
 	r.Get("/dashboard/hr/extra-questions", adminOnly, dashH.ExtraQuestions)
 	r.Get("/dashboard/hr/topics/:id", adminOnly, dashH.TopicDrilldown)
+	r.Get("/hr/departments", adminOnly, departmentsH.List)
+	r.Post("/hr/departments", adminOnly, departmentsH.Create)
+	r.Patch("/hr/departments/:id", adminOnly, departmentsH.Update)
+	r.Delete("/hr/departments/:id", adminOnly, departmentsH.Delete)
+	r.Post("/ai/train", adminOnly, trainingH.Train)
 	r.Get("/survey-periods", adminOnly, periodsH.List)
 	r.Post("/survey-periods", adminOnly, periodsH.Create)
 	r.Post("/survey-periods/:id/close", adminOnly, periodsH.Close)
