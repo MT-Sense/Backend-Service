@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -139,6 +140,15 @@ func (s *Service) RespondentCounts(periodID string) (map[string]int64, error) {
 	return out, nil
 }
 
+// UnassignedRespondentCount counts responses without a department snapshot for the heatmap.
+func (s *Service) UnassignedRespondentCount(periodID string) (int64, error) {
+	var n int64
+	err := s.db.Model(&models.SurveyResponse{}).
+		Where("period_id = ? AND department_id IS NULL", periodID).
+		Count(&n).Error
+	return n, err
+}
+
 // TotalRespondents counts submissions for the period across the whole company.
 func (s *Service) TotalRespondents(periodID string) (int64, error) {
 	var n int64
@@ -201,8 +211,8 @@ func (s *Service) ENPS(periodID string) (ENPSResult, error) {
 	err := s.db.Model(&models.SurveyResponse{}).
 		Where("period_id = ?", periodID).
 		Select(`
-			COUNT(*) FILTER (WHERE satisfaction_score = 5) AS promoters,
-			COUNT(*) FILTER (WHERE satisfaction_score <= 3) AS detractors,
+			COUNT(*) FILTER (WHERE satisfaction_score >= 4) AS promoters,
+			COUNT(*) FILTER (WHERE satisfaction_score <= 2) AS detractors,
 			COUNT(*) AS total`).
 		Scan(&row).Error
 	if err != nil || row.Total == 0 {
@@ -337,39 +347,64 @@ type DeptTopicScore struct {
 	Respondents  int64
 }
 
-// DepartmentTopicScores returns only cells whose department cleared the n<5 threshold. Runs
-// one query per topic (small, fixed-size taxonomy) using jsonb containment on
-// response_analysis.categories, the same cast-at-query-time pattern as FeedPost.Hashtags.
-func (s *Service) DepartmentTopicScores(periodID string, topics []models.Topic) ([]DeptTopicScore, error) {
-	out := make([]DeptTopicScore, 0, len(topics)*4)
-	for _, topic := range topics {
-		containsTopic, err := json.Marshal([]string{topic.ID})
-		if err != nil {
-			return nil, err
-		}
-		var rows []struct {
-			DepartmentID string
-			Score        float64
-			Respondents  int64
-		}
-		err = s.db.Model(&models.SurveyResponse{}).
-			Joins("JOIN response_analysis ON response_analysis.response_id = survey_responses.id").
-			Where("survey_responses.period_id = ? AND survey_responses.department_id IS NOT NULL AND response_analysis.categories::jsonb @> ?::jsonb", periodID, string(containsTopic)).
-			Group("survey_responses.department_id").
-			Having("COUNT(DISTINCT survey_responses.id) >= ?", privacy.MinGroupSizeSQL).
-			Select(`
-				survey_responses.department_id AS department_id,
-				ROUND(AVG(survey_responses.satisfaction_score)::numeric, 1)::float8 AS score,
-				COUNT(DISTINCT survey_responses.id) AS respondents`).
-			Scan(&rows).Error
-		if err != nil {
-			return nil, err
-		}
-		for _, r := range rows {
-			out = append(out, DeptTopicScore{DepartmentID: r.DepartmentID, TopicID: topic.ID, Score: r.Score, Respondents: r.Respondents})
-		}
+// UnassignedDepartmentID groups anonymous responses that have no department snapshot.
+// It is only used by the HR heatmap and is not a persisted department ID.
+const UnassignedDepartmentID = "__unassigned__"
+
+// DepartmentPeriodScores returns overall satisfaction averages only for department
+// groups that meet the five-response privacy threshold. It also includes the
+// unassigned group when large enough, using the heatmap sentinel ID.
+func (s *Service) DepartmentPeriodScores(periodID string) (map[string]float64, error) {
+	var rows []struct {
+		DepartmentID string
+		Score        float64
 	}
-	return out, nil
+	err := s.db.Raw(`
+		SELECT COALESCE(department_id, '__unassigned__') AS department_id,
+		       ROUND(AVG(satisfaction_score)::numeric, 1)::float8 AS score
+		FROM survey_responses
+		WHERE org_id = ? AND period_id = ?
+		GROUP BY COALESCE(department_id, '__unassigned__')
+		HAVING COUNT(DISTINCT id) >= ?`,
+		s.orgID, periodID, privacy.MinGroupSizeSQL,
+	).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	scores := make(map[string]float64, len(rows))
+	for _, row := range rows {
+		scores[row.DepartmentID] = row.Score
+	}
+	return scores, nil
+}
+
+// DepartmentTopicScores expands the category IDs stored on each response_analysis row,
+// matches them to the topic catalog, and averages the linked survey's satisfaction score.
+// DISTINCT prevents a duplicated category ID in one JSON array from counting a response twice.
+// The SQL HAVING gate keeps cells with fewer than five respondents off the wire.
+func (s *Service) DepartmentTopicScores(periodID string) ([]DeptTopicScore, error) {
+	var scores []DeptTopicScore
+	err := s.db.Raw(`
+		SELECT COALESCE(survey_responses.department_id, '__unassigned__') AS department_id,
+		       category.value AS topic_id,
+		       ROUND(AVG(survey_responses.satisfaction_score)::numeric, 1)::float8 AS score,
+		       COUNT(DISTINCT survey_responses.id) AS respondents
+		FROM survey_responses
+		JOIN response_analysis ON response_analysis.response_id = survey_responses.id
+		CROSS JOIN LATERAL (
+			SELECT DISTINCT value
+			FROM jsonb_array_elements_text(response_analysis.categories::jsonb) AS category(value)
+		) AS category
+		JOIN topics ON topics.id = category.value
+		WHERE survey_responses.period_id = ?
+		GROUP BY COALESCE(survey_responses.department_id, '__unassigned__'), category.value
+		HAVING COUNT(DISTINCT survey_responses.id) >= ?`,
+		periodID, privacy.MinGroupSizeSQL,
+	).Scan(&scores).Error
+	if err != nil {
+		return nil, err
+	}
+	return scores, nil
 }
 
 // TopicAverages returns the company-wide average per topic for a period (no suppression —
@@ -544,6 +579,174 @@ type TopicStats struct {
 	PercentageTagged int
 }
 
+type DepartmentTopicDetail struct {
+	TopicStats
+	Trend        []TopicTrendPoint
+	Sentiment    models.SentimentSplit
+	SampleQuotes []string
+}
+
+func (s *Service) departmentTopicResponses(periodID, topicID, departmentID string) (*gorm.DB, error) {
+	containsTopic, err := json.Marshal([]string{topicID})
+	if err != nil {
+		return nil, err
+	}
+	query := s.db.Model(&models.SurveyResponse{}).
+		Joins("JOIN response_analysis ON response_analysis.response_id = survey_responses.id").
+		Where("survey_responses.org_id = ? AND survey_responses.period_id = ? AND response_analysis.categories::jsonb @> ?::jsonb", s.orgID, periodID, string(containsTopic))
+	if departmentID == UnassignedDepartmentID {
+		query = query.Where("survey_responses.department_id IS NULL")
+	} else {
+		query = query.Where("survey_responses.department_id = ?", departmentID)
+	}
+	return query, nil
+}
+
+func (s *Service) departmentTopicScore(periodID, topicID, departmentID string) (float64, int64, bool, error) {
+	query, err := s.departmentTopicResponses(periodID, topicID, departmentID)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	var row struct {
+		Score       float64
+		Respondents int64
+	}
+	result := query.Group("survey_responses.department_id").
+		Having("COUNT(DISTINCT survey_responses.id) >= ?", privacy.MinGroupSizeSQL).
+		Select("ROUND(AVG(survey_responses.satisfaction_score)::numeric, 1)::float8 AS score, COUNT(DISTINCT survey_responses.id) AS respondents").
+		Scan(&row)
+	return row.Score, row.Respondents, result.RowsAffected > 0, result.Error
+}
+
+// DepartmentTopicDetail returns data only when this department/topic/period has at
+// least five distinct responses. The same gate is applied separately to trend points.
+func (s *Service) DepartmentTopicDetail(period *models.SurveyPeriod, topicID, departmentID string) (*DepartmentTopicDetail, error) {
+	score, n, visible, err := s.departmentTopicScore(period.ID, topicID, departmentID)
+	if err != nil || !visible {
+		return nil, err
+	}
+	detail := &DepartmentTopicDetail{
+		TopicStats: TopicStats{Score: score, RespondentCount: n},
+		Trend:      make([]TopicTrendPoint, 0), SampleQuotes: make([]string, 0),
+	}
+	detail.CompanyAverage, err = s.SatisfactionAverage(period.ID)
+	if err != nil {
+		return nil, err
+	}
+	var total int64
+	totalQuery := s.db.Model(&models.SurveyResponse{}).Where("org_id = ? AND period_id = ?", s.orgID, period.ID)
+	if departmentID == UnassignedDepartmentID {
+		totalQuery = totalQuery.Where("department_id IS NULL")
+	} else {
+		totalQuery = totalQuery.Where("department_id = ?", departmentID)
+	}
+	if err := totalQuery.Count(&total).Error; err != nil {
+		return nil, err
+	}
+	if total > 0 {
+		detail.PercentageTagged = int(round(float64(n)/float64(total)*100, 0))
+	}
+
+	query, err := s.departmentTopicResponses(period.ID, topicID, departmentID)
+	if err != nil {
+		return nil, err
+	}
+	var sentiment struct{ Positive, Neutral, Negative, Total int64 }
+	if err := query.Select(`
+		COUNT(*) FILTER (WHERE response_analysis.sentiment_label = 'pos') AS positive,
+		COUNT(*) FILTER (WHERE response_analysis.sentiment_label = 'neu') AS neutral,
+		COUNT(*) FILTER (WHERE response_analysis.sentiment_label = 'neg') AS negative,
+		COUNT(*) AS total`).Scan(&sentiment).Error; err != nil {
+		return nil, err
+	}
+	if sentiment.Total > 0 {
+		pct := func(count int64) int { return int(round(float64(count)/float64(sentiment.Total)*100, 0)) }
+		detail.Sentiment = models.SentimentSplit{Positive: pct(sentiment.Positive), Neutral: pct(sentiment.Neutral), Negative: pct(sentiment.Negative)}
+		detail.Sentiment.Positive += 100 - (detail.Sentiment.Positive + detail.Sentiment.Neutral + detail.Sentiment.Negative)
+	}
+
+	detail.SampleQuotes, err = s.TopicSampleQuotes(period.ID, topicID, departmentID)
+	if err != nil {
+		return nil, err
+	}
+
+	periods, err := s.RecentPeriods(period, 6)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range periods {
+		pointScore, _, pointVisible, err := s.departmentTopicScore(p.ID, topicID, departmentID)
+		if err != nil {
+			return nil, err
+		}
+		if pointVisible {
+			detail.Trend = append(detail.Trend, TopicTrendPoint{Month: periodLabel(p), Score: pointScore})
+		}
+	}
+	return detail, nil
+}
+
+// TopicSampleQuotes reads real, redacted survey comments from this org and period.
+// The SQL gate prevents any comment from a topic group below five responses from
+// reaching Go. An empty departmentID means company-wide; the unassigned sentinel
+// selects responses whose department snapshot is NULL.
+func (s *Service) TopicSampleQuotes(periodID, topicID, departmentID string) ([]string, error) {
+	containsTopic, err := json.Marshal([]string{topicID})
+	if err != nil {
+		return nil, err
+	}
+	departmentClause := ""
+	args := []any{s.orgID, periodID, string(containsTopic)}
+	if departmentID == UnassignedDepartmentID {
+		departmentClause = " AND survey_responses.department_id IS NULL"
+	} else if departmentID != "" {
+		departmentClause = " AND survey_responses.department_id = ?"
+		args = append(args, departmentID)
+	}
+	args = append(args, privacy.MinGroupSizeSQL)
+	var rows []struct{ CommentText string }
+	err = s.db.Raw(`
+		WITH eligible AS (
+			SELECT survey_responses.id, survey_responses.comment_text, survey_responses.submitted_at
+			FROM survey_responses
+			JOIN response_analysis ON response_analysis.response_id = survey_responses.id
+			WHERE survey_responses.org_id = ? AND survey_responses.period_id = ?
+			  AND response_analysis.categories::jsonb @> ?::jsonb`+departmentClause+`
+		), safe AS (
+			SELECT 1 FROM eligible HAVING COUNT(DISTINCT id) >= ?
+		)
+		SELECT eligible.comment_text
+		FROM eligible CROSS JOIN safe
+		WHERE btrim(eligible.comment_text) <> ''
+		ORDER BY eligible.submitted_at DESC, eligible.id DESC
+		LIMIT 15`, args...).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	texts := make([]string, 0, len(rows))
+	for _, row := range rows {
+		texts = append(texts, row.CommentText)
+	}
+	return safeSampleQuotes(texts), nil
+}
+
+func safeSampleQuotes(texts []string) []string {
+	quotes := make([]string, 0, 3)
+	seen := make(map[string]bool)
+	for _, text := range texts {
+		quote := strings.TrimSpace(privacy.Redact(text))
+		if quote == "" || quote == "[ถูกปกปิด]" || seen[quote] {
+			continue
+		}
+		seen[quote] = true
+		quotes = append(quotes, quote)
+		if len(quotes) == 3 {
+			break
+		}
+	}
+	return quotes
+}
+
 func (s *Service) TopicStats(periodID, topicID string) (TopicStats, error) {
 	containsTopic, err := json.Marshal([]string{topicID})
 	if err != nil {
@@ -607,20 +810,20 @@ func (s *Service) TopicTrend(upTo *models.SurveyPeriod, topicID string, months i
 
 	points := make([]TopicTrendPoint, 0, len(periods))
 	for _, p := range periods {
-		var avg *float64
-		err := s.db.Model(&models.SurveyResponse{}).
+		var row struct{ Score float64 }
+		result := s.db.Model(&models.SurveyResponse{}).
 			Joins("JOIN response_analysis ON response_analysis.response_id = survey_responses.id").
 			Where("survey_responses.period_id = ? AND response_analysis.categories::jsonb @> ?::jsonb", p.ID, string(containsTopic)).
-			Select("AVG(survey_responses.satisfaction_score)").
-			Scan(&avg).Error
-		if err != nil {
-			return nil, err
+			Group("survey_responses.period_id").
+			Having("COUNT(DISTINCT survey_responses.id) >= ?", privacy.MinGroupSizeSQL).
+			Select("ROUND(AVG(survey_responses.satisfaction_score)::numeric, 2)::float8 AS score").
+			Scan(&row)
+		if result.Error != nil {
+			return nil, result.Error
 		}
-		point := TopicTrendPoint{Month: periodLabel(p)}
-		if avg != nil {
-			point.Score = round(*avg, 2)
+		if result.RowsAffected > 0 {
+			points = append(points, TopicTrendPoint{Month: periodLabel(p), Score: row.Score})
 		}
-		points = append(points, point)
 	}
 	return points, nil
 }

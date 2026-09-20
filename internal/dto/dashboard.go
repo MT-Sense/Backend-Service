@@ -113,6 +113,23 @@ type Heatmap struct {
 	Rows   []HeatmapRow `json:"rows"`
 }
 
+// DepartmentSummary is the HR dashboard's per-department participation and score view.
+// Suppressible fields never carry values from groups with 1-4 responses.
+type DepartmentSummaryRow struct {
+	DepartmentID string                `json:"departmentId"`
+	Name         string                `json:"name"`
+	Responded    Suppressible[int64]   `json:"responded"`
+	Total        *int64                `json:"total"`
+	Score        Suppressible[float64] `json:"score"`
+	Change       *float64              `json:"change"`
+	Forecast     *float64              `json:"forecast"`
+	Status       string                `json:"status"`
+}
+
+type DepartmentSummary struct {
+	Rows []DepartmentSummaryRow `json:"rows"`
+}
+
 // --- AI insight ---
 
 type IssueConfidence struct {
@@ -194,6 +211,8 @@ type TopicSubIssue struct {
 type TopicDrilldown struct {
 	TopicID          string            `json:"topicId"`
 	Label            Localized         `json:"label"`
+	DepartmentID     string            `json:"departmentId,omitempty"`
+	DepartmentName   string            `json:"departmentName,omitempty"`
 	Score            float64           `json:"score"`
 	CompanyAverage   float64           `json:"companyAverage"`
 	RespondentCount  int64             `json:"respondentCount"`
@@ -300,12 +319,12 @@ func NewDecisionItems(items []models.DecisionItem) []DecisionItem {
 // --- alerts ---
 
 type Alert struct {
-	ID                   string  `json:"id"`
-	AlertType            string  `json:"alertType"`
-	Severity             string  `json:"severity"`
-	Message              string  `json:"message"`
-	RelatedDepartmentID  *string `json:"relatedDepartmentId,omitempty"`
-	RelatedPositionID    *string `json:"relatedPositionId,omitempty"`
+	ID                  string  `json:"id"`
+	AlertType           string  `json:"alertType"`
+	Severity            string  `json:"severity"`
+	Message             string  `json:"message"`
+	RelatedDepartmentID *string `json:"relatedDepartmentId,omitempty"`
+	RelatedPositionID   *string `json:"relatedPositionId,omitempty"`
 }
 
 func NewAlerts(alerts []models.Alert) []Alert {

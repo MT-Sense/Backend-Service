@@ -37,8 +37,9 @@ func main() {
 	app := fiber.New(fiber.Config{
 		AppName:      "MT-Sense API",
 		ErrorHandler: errorHandler,
+		BodyLimit:    10 << 20,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		WriteTimeout: 6 * time.Minute,
 	})
 
 	app.Use(recover.New())
