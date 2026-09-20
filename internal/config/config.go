@@ -11,13 +11,15 @@ import (
 )
 
 type Config struct {
-	Port        string
-	DatabaseURL string
-	JWTSecret   string
-	AccessTTL   time.Duration
-	RefreshTTL  time.Duration
-	CORSOrigins string
-	SeedOnBoot  bool
+	Port            string
+	DatabaseURL     string
+	JWTSecret       string
+	AccessTTL       time.Duration
+	RefreshTTL      time.Duration
+	CORSOrigins     string
+	SeedOnBoot      bool
+	AIServiceURL    string
+	AITrainingToken string
 }
 
 // Load reads .env when present (absent is fine — real deployments use real env vars)
@@ -34,13 +36,15 @@ func Load() *Config {
 	}
 
 	return &Config{
-		Port:        env("PORT", "8080"),
-		DatabaseURL: databaseURL(),
-		JWTSecret:   secret,
-		AccessTTL:   duration("ACCESS_TOKEN_TTL", 15*time.Minute),
-		RefreshTTL:  duration("REFRESH_TOKEN_TTL", 168*time.Hour),
-		CORSOrigins: env("CORS_ORIGINS", "http://localhost:5173,http://localhost:5174"),
-		SeedOnBoot:  env("SEED_ON_BOOT", "true") == "true",
+		Port:            env("PORT", "8080"),
+		DatabaseURL:     databaseURL(),
+		JWTSecret:       secret,
+		AccessTTL:       duration("ACCESS_TOKEN_TTL", 15*time.Minute),
+		RefreshTTL:      duration("REFRESH_TOKEN_TTL", 168*time.Hour),
+		CORSOrigins:     env("CORS_ORIGINS", "http://localhost:5173,http://localhost:5174"),
+		SeedOnBoot:      env("SEED_ON_BOOT", "true") == "true",
+		AIServiceURL:    env("AI_SERVICE_URL", "http://127.0.0.1:8000"),
+		AITrainingToken: os.Getenv("AI_TRAINING_TOKEN"),
 	}
 }
 

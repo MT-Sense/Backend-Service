@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"log"
 	"strings"
 	"time"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"github.com/mt-sense/backend-service/internal/aiservice"
 	"github.com/mt-sense/backend-service/internal/analytics"
 	"github.com/mt-sense/backend-service/internal/dto"
 	"github.com/mt-sense/backend-service/internal/middleware"
@@ -18,10 +20,11 @@ import (
 type SurveyHandler struct {
 	db    *gorm.DB
 	stats *analytics.Service
+	ai    *aiservice.Client
 }
 
-func NewSurveyHandler(db *gorm.DB, stats *analytics.Service) *SurveyHandler {
-	return &SurveyHandler{db: db, stats: stats}
+func NewSurveyHandler(db *gorm.DB, stats *analytics.Service, ai *aiservice.Client) *SurveyHandler {
+	return &SurveyHandler{db: db, stats: stats, ai: ai}
 }
 
 // Current returns the currently open survey period, if any, and whether the caller already
@@ -117,27 +120,35 @@ func (h *SurveyHandler) Submit(c *fiber.Ctx) error {
 		response.CommentText = redacted
 
 		if redacted != "" {
-			sentimentLabel, sentimentScore := classifySentiment(redacted)
-			categories := classifyCategories(redacted)
-			confidence, lowConfidence := confidenceFor(categories, sentimentScore)
+			// The AI service only receives text after PII redaction. If it is down,
+			// leave the submission untouched so we never store unanalysed feedback
+			// while reporting success to the employee.
+			result, err := h.ai.Analyze(c.UserContext(), redacted)
+			if err != nil {
+				log.Printf("survey analysis failed: %v", err)
+				return fiber.NewError(fiber.StatusServiceUnavailable, "text analysis is temporarily unavailable; please try again")
+			}
 
 			analysis = &models.ResponseAnalysis{
 				ID:             uuid.NewString(),
 				ResponseID:     response.ID,
-				SentimentLabel: sentimentLabel,
-				SentimentScore: sentimentScore,
-				Confidence:     confidence,
-				LowConfidence:  lowConfidence,
-				Categories:     categories,
+				SentimentLabel: result.SentimentLabel,
+				SentimentScore: result.SentimentScore,
+				Confidence:     result.Confidence,
+				LowConfidence:  result.LowConfidence,
+				Categories:     result.Categories,
+				Reason:         result.Reason,
 				AnalyzedAt:     now,
 			}
+
+			log.Printf("survey analysis result: %v", result)
 
 			// Gate one of the feed flow: the author opted in. Gate two (moderation) is a
 			// separate HR action, so the post starts unpublished.
 			if req.OptedInToFeed {
 				tags := req.Tags
 				if len(tags) == 0 {
-					tags = categories
+					tags = result.Categories
 				}
 				feedPost = &models.FeedPost{
 					ID:        uuid.NewString(),
@@ -207,81 +218,3 @@ func (h *SurveyHandler) Submit(c *fiber.Ctx) error {
 	// The receipt confirms the submission, never the submitter.
 	return c.Status(fiber.StatusCreated).JSON(dto.SubmitResponseReceipt{SubmittedAt: now})
 }
-
-// classifySentiment and classifyCategories are keyword heuristics standing in for the
-// analysis pipeline.
-// ponytail: lexicon lookup, no negation handling; replace with the real classifier — the
-// columns they write and every aggregate reading them stay the same.
-func classifySentiment(text string) (label string, score float32) {
-	lowered := strings.ToLower(text)
-	positive, negative := 0, 0
-	for _, w := range positiveWords {
-		if strings.Contains(lowered, w) {
-			positive++
-		}
-	}
-	for _, w := range negativeWords {
-		if strings.Contains(lowered, w) {
-			negative++
-		}
-	}
-	total := positive + negative
-	switch {
-	case positive > negative:
-		if total > 0 {
-			score = float32(positive-negative) / float32(total)
-		}
-		return "pos", score
-	case negative > positive:
-		if total > 0 {
-			score = float32(positive-negative) / float32(total)
-		}
-		return "neg", score
-	default:
-		return "neu", 0
-	}
-}
-
-// classifyCategories tags a comment with topics from the fixed taxonomy by keyword match.
-func classifyCategories(text string) []string {
-	lowered := strings.ToLower(text)
-	var categories []string
-	for _, topicID := range topicOrder {
-		for _, w := range topicKeywords[topicID] {
-			if strings.Contains(lowered, w) {
-				categories = append(categories, topicID)
-				break
-			}
-		}
-	}
-	return categories
-}
-
-func confidenceFor(categories []string, sentimentScore float32) (confidence float32, low bool) {
-	confidence = 0.5 + float32(len(categories))*0.1
-	if sentimentScore < 0 {
-		sentimentScore = -sentimentScore
-	}
-	confidence += sentimentScore * 0.1
-	if confidence > 0.95 {
-		confidence = 0.95
-	}
-	return confidence, confidence < 0.6
-}
-
-var (
-	positiveWords = []string{"ดี", "ชอบ", "ขอบคุณ", "สนุก", "ประทับใจ", "ดีขึ้น", "สนับสนุน", "good", "great", "love", "thanks", "better"}
-	negativeWords = []string{"หนัก", "เหนื่อย", "ไม่พอ", "ล่าช้า", "ไม่ชัดเจน", "ปัญหา", "แย่", "เครียด", "ไม่เป็นธรรม", "bad", "tired", "unclear", "problem", "stress", "overwork"}
-
-	// topicOrder keeps classification output deterministic (map iteration order is not).
-	topicOrder = []string{"work", "team", "manager", "compensation", "growth", "benefits"}
-
-	topicKeywords = map[string][]string{
-		"work":         {"งาน", "ภาระงาน", "กะดึก", "ot", "โอที", "workload", "overtime", "shift"},
-		"team":         {"ทีม", "เพื่อนร่วมงาน", "team", "colleague"},
-		"manager":      {"หัวหน้า", "ผู้จัดการ", "manager", "supervisor", "feedback", "ฟีดแบ็ก"},
-		"compensation": {"เงินเดือน", "ค่าตอบแทน", "โบนัส", "salary", "compensation", "bonus", "pay"},
-		"growth":       {"เติบโต", "โอกาส", "เส้นทางอาชีพ", "growth", "career", "promotion", "training", "ฝึกอบรม"},
-		"benefits":     {"สวัสดิการ", "ประกัน", "ลาพัก", "benefits", "insurance", "leave", "wellness"},
-	}
-)
