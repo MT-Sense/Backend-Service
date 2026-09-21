@@ -50,7 +50,7 @@ func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) {
 	surveyH := handlers.NewSurveyHandler(db, stats, ai)
 	trainingH := handlers.NewModelTrainingHandler(db, ai, cfg.AITrainingToken)
 	feedH := handlers.NewFeedHandler(db, cfg.JWTSecret)
-	periodsH := handlers.NewPeriodsHandler(db, stats)
+	periodsH := handlers.NewPeriodsHandler(db, stats, ai)
 	onboardH := handlers.NewOnboardingHandler(db, issuer)
 	departmentsH := handlers.NewDepartmentsHandler(db)
 
@@ -101,6 +101,7 @@ func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) {
 	// Admin (HR) only — analysis, drill-downs (the only endpoint returning sample text),
 	// survey-period scheduling, and feed moderation.
 	r.Get("/dashboard/hr/kpi", adminOnly, dashH.HRKpis)
+	r.Get("/dashboard/hr/trend", adminOnly, dashH.DepartmentTrend)
 	r.Get("/dashboard/hr/heatmap", adminOnly, dashH.Heatmap)
 	r.Get("/dashboard/hr/departments", adminOnly, dashH.DepartmentSummary)
 	r.Get("/dashboard/hr/wordcloud", adminOnly, dashH.WordCloud)
@@ -116,6 +117,8 @@ func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) {
 	r.Get("/survey-periods", adminOnly, periodsH.List)
 	r.Post("/survey-periods", adminOnly, periodsH.Create)
 	r.Post("/survey-periods/:id/close", adminOnly, periodsH.Close)
+	r.Post("/survey-periods/:id/import/preview", adminOnly, periodsH.PreviewImport)
+	r.Post("/survey-periods/:id/import", adminOnly, periodsH.ImportWorkbook)
 	r.Get("/feed/pending", adminOnly, feedH.PendingModeration)
 	r.Patch("/feed/:id/moderate", adminOnly, feedH.Moderate)
 	r.Get("/org/join-code", adminOnly, onboardH.GetJoinCode)

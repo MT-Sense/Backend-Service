@@ -313,6 +313,9 @@ type TrendPoint struct {
 	Month        string  `json:"month"`
 	ENPS         int     `json:"enps"`
 	Satisfaction float64 `json:"satisfaction"`
+	ResponseRate int     `json:"responseRate"`
+	BurnoutRisk  int     `json:"burnoutRisk"`
+	HasResponses bool    `json:"hasResponses"`
 }
 
 // Trend returns up to `months` periods ending at `upTo`, oldest first.
@@ -321,8 +324,16 @@ func (s *Service) Trend(upTo *models.SurveyPeriod, months int) ([]TrendPoint, er
 	if err != nil {
 		return nil, err
 	}
+	var headcount int64
+	if err := s.db.Model(&models.User{}).Where("org_id = ? AND is_active = ?", s.orgID, true).Count(&headcount).Error; err != nil {
+		return nil, err
+	}
 	points := make([]TrendPoint, 0, len(periods))
 	for _, p := range periods {
+		responded, err := s.TotalRespondents(p.ID)
+		if err != nil {
+			return nil, err
+		}
 		enps, err := s.ENPS(p.ID)
 		if err != nil {
 			return nil, err
@@ -331,7 +342,85 @@ func (s *Service) Trend(upTo *models.SurveyPeriod, months int) ([]TrendPoint, er
 		if err != nil {
 			return nil, err
 		}
-		points = append(points, TrendPoint{Month: periodLabel(p), ENPS: enps.Value, Satisfaction: sat})
+		burnoutRisk, _, err := s.BurnoutRisk(p.ID)
+		if err != nil {
+			return nil, err
+		}
+		responseRate := 0
+		if headcount > 0 {
+			responseRate = int(float64(responded) / float64(headcount) * 100)
+		}
+		points = append(points, TrendPoint{
+			Month: periodLabel(p), ENPS: enps.Value, Satisfaction: sat,
+			ResponseRate: responseRate, BurnoutRisk: burnoutRisk, HasResponses: responded > 0,
+		})
+	}
+	return points, nil
+}
+
+// DepartmentTrend exposes a department's monthly values only when that period has at
+// least five responses. Missing and suppressed periods both have null metric values.
+type DepartmentTrendPoint struct {
+	Month        string   `json:"month"`
+	ENPS         *int     `json:"enps"`
+	Satisfaction *float64 `json:"satisfaction"`
+	ResponseRate *int     `json:"responseRate"`
+	BurnoutRisk  *int     `json:"burnoutRisk"`
+}
+
+func (s *Service) DepartmentTrend(upTo *models.SurveyPeriod, months int, departmentID string) ([]DepartmentTrendPoint, error) {
+	periods, err := s.RecentPeriods(upTo, months)
+	if err != nil {
+		return nil, err
+	}
+	var headcount int64
+	if departmentID != UnassignedDepartmentID {
+		if err := s.db.Model(&models.User{}).
+			Where("org_id = ? AND department_id = ? AND is_active = ?", s.orgID, departmentID, true).
+			Count(&headcount).Error; err != nil {
+			return nil, err
+		}
+	}
+
+	points := make([]DepartmentTrendPoint, 0, len(periods))
+	for _, period := range periods {
+		point := DepartmentTrendPoint{Month: periodLabel(period)}
+		var row struct {
+			Total      int64
+			Promoters  int64
+			Detractors int64
+			AtRisk     int64
+			Average    *float64
+		}
+		query := s.db.Model(&models.SurveyResponse{}).
+			Where("org_id = ? AND period_id = ?", s.orgID, period.ID)
+		if departmentID == UnassignedDepartmentID {
+			query = query.Where("department_id IS NULL")
+		} else {
+			query = query.Where("department_id = ?", departmentID)
+		}
+		err := query.Select(`
+			COUNT(*) AS total,
+			COUNT(*) FILTER (WHERE satisfaction_score >= 4) AS promoters,
+			COUNT(*) FILTER (WHERE satisfaction_score <= 2) AS detractors,
+			COUNT(*) FILTER (WHERE satisfaction_score <= 2) AS at_risk,
+			AVG(satisfaction_score) AS average`).Scan(&row).Error
+		if err != nil {
+			return nil, err
+		}
+		if row.Total >= privacy.MinGroupSizeSQL && row.Average != nil {
+			enps := int(round(float64(row.Promoters-row.Detractors)/float64(row.Total)*100, 0))
+			satisfaction := round(*row.Average, 2)
+			burnoutRisk := int(round(float64(row.AtRisk)/float64(row.Total)*100, 0))
+			point.ENPS = &enps
+			point.Satisfaction = &satisfaction
+			point.BurnoutRisk = &burnoutRisk
+			if headcount > 0 {
+				responseRate := int(float64(row.Total) / float64(headcount) * 100)
+				point.ResponseRate = &responseRate
+			}
+		}
+		points = append(points, point)
 	}
 	return points, nil
 }

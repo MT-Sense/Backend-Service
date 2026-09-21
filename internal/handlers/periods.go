@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"github.com/mt-sense/backend-service/internal/aiservice"
 	"github.com/mt-sense/backend-service/internal/analytics"
 	"github.com/mt-sense/backend-service/internal/dto"
 	"github.com/mt-sense/backend-service/internal/middleware"
@@ -18,10 +19,11 @@ import (
 type PeriodsHandler struct {
 	db    *gorm.DB
 	stats *analytics.Service
+	ai    *aiservice.Client
 }
 
-func NewPeriodsHandler(db *gorm.DB, stats *analytics.Service) *PeriodsHandler {
-	return &PeriodsHandler{db: db, stats: stats}
+func NewPeriodsHandler(db *gorm.DB, stats *analytics.Service, ai *aiservice.Client) *PeriodsHandler {
+	return &PeriodsHandler{db: db, stats: stats, ai: ai}
 }
 
 // List returns every survey period for the org, newest first, with response counts.

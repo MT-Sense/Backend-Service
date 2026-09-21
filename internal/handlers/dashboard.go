@@ -121,6 +121,35 @@ func (h *DashboardHandler) HRKpis(c *fiber.Ctx) error {
 	})
 }
 
+// DepartmentTrend returns only privacy-safe monthly aggregates for a department.
+func (h *DashboardHandler) DepartmentTrend(c *fiber.Ctx) error {
+	orgID := middleware.OrgID(c)
+	departmentID := strings.TrimSpace(c.Query("department"))
+	if departmentID == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "department is required")
+	}
+	if departmentID != analytics.UnassignedDepartmentID {
+		var count int64
+		if err := h.db.Model(&models.Department{}).
+			Where("org_id = ? AND id = ?", orgID, departmentID).Count(&count).Error; err != nil {
+			return err
+		}
+		if count == 0 {
+			return fiber.NewError(fiber.StatusNotFound, "department not found")
+		}
+	}
+	stats := h.stats.WithOrg(orgID)
+	period, err := h.resolvePeriod(c, stats)
+	if err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "no survey period found")
+	}
+	points, err := stats.DepartmentTrend(period, 6, departmentID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(points)
+}
+
 func trendDirection(current, previous float64) string {
 	switch {
 	case current > previous+0.05:
@@ -415,17 +444,15 @@ func (h *DashboardHandler) Insight(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusNotFound, "no survey period found")
 	}
 
-	var insight models.AIInsight
-	if err := h.db.Where("org_id = ? AND period_id = ?", orgID, period.ID).First(&insight).Error; err != nil {
-		return fiber.NewError(fiber.StatusNotFound, "no insight generated for this period yet")
-	}
-
-	var urgent []models.UrgentIssue
-	if err := h.db.Where("org_id = ? AND period_id = ?", orgID, period.ID).Order("rank").Find(&urgent).Error; err != nil {
+	insight, urgent, err := stats.GenerateInsight(period)
+	if err != nil {
 		return err
 	}
+	if insight == nil {
+		return fiber.NewError(fiber.StatusNotFound, "at least 5 analyzed responses are required to generate insight")
+	}
 
-	return c.JSON(dto.NewInsight(&insight, urgent))
+	return c.JSON(dto.NewInsight(insight, urgent))
 }
 
 // Alerts serves the HR-only alerts panel, generating them on demand if they haven't been

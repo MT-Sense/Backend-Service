@@ -80,9 +80,25 @@ func (c *Client) Train(ctx context.Context, data []byte, token string) (*Trainin
 }
 
 func (c *Client) Analyze(ctx context.Context, text string) (*Result, error) {
+	results, err := c.analyze(ctx, []string{text}, c.http)
+	if err != nil {
+		return nil, err
+	}
+	return &results[0], nil
+}
+
+// AnalyzeMany is used by HR workbook imports; the AI service processes texts in batches.
+func (c *Client) AnalyzeMany(ctx context.Context, texts []string) ([]Result, error) {
+	if len(texts) == 0 {
+		return []Result{}, nil
+	}
+	return c.analyze(ctx, texts, &http.Client{Timeout: 5 * time.Minute})
+}
+
+func (c *Client) analyze(ctx context.Context, texts []string, client *http.Client) ([]Result, error) {
 	body, err := json.Marshal(struct {
 		Texts []string `json:"texts"`
-	}{Texts: []string{text}})
+	}{Texts: texts})
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +107,7 @@ func (c *Client) Analyze(ctx context.Context, text string) (*Result, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.http.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("AI request failed: %w", err)
 	}
@@ -102,25 +118,26 @@ func (c *Client) Analyze(ctx context.Context, text string) (*Result, error) {
 	var payload struct {
 		Results []Result `json:"results"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&payload); err != nil {
 		return nil, fmt.Errorf("invalid AI response: %w", err)
 	}
-	if len(payload.Results) != 1 {
+	if len(payload.Results) != len(texts) {
 		return nil, errors.New("AI service returned an unexpected number of results")
 	}
-	result := &payload.Results[0]
-	if result.SentimentLabel != "pos" && result.SentimentLabel != "neg" && result.SentimentLabel != "neu" {
-		return nil, errors.New("AI service returned an unknown sentiment label")
-	}
-	if result.SentimentScore < -1 || result.SentimentScore > 1 || result.Confidence < 0 || result.Confidence > 1 {
-		return nil, errors.New("AI service returned a score outside the expected range")
-	}
-	for _, category := range result.Categories {
-		if !validCategory(category) {
-			return nil, fmt.Errorf("AI service returned an unknown category %q", category)
+	for _, result := range payload.Results {
+		if result.SentimentLabel != "pos" && result.SentimentLabel != "neg" && result.SentimentLabel != "neu" {
+			return nil, errors.New("AI service returned an unknown sentiment label")
+		}
+		if result.SentimentScore < -1 || result.SentimentScore > 1 || result.Confidence < 0 || result.Confidence > 1 {
+			return nil, errors.New("AI service returned a score outside the expected range")
+		}
+		for _, category := range result.Categories {
+			if !validCategory(category) {
+				return nil, fmt.Errorf("AI service returned an unknown category %q", category)
+			}
 		}
 	}
-	return result, nil
+	return payload.Results, nil
 }
 
 // Keywords segments redacted survey comments into useful words. Each inner slice is

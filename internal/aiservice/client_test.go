@@ -49,6 +49,26 @@ func TestAnalyzeRejectsUnknownDashboardCategory(t *testing.T) {
 	}
 }
 
+func TestAnalyzeManyPreservesOrder(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Texts []string `json:"texts"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+		}
+		if len(request.Texts) != 2 || request.Texts[0] != "ดี" || request.Texts[1] != "แย่" {
+			t.Errorf("unexpected request order: %v", request.Texts)
+		}
+		_, _ = w.Write([]byte(`{"results":[{"sentiment_label":"pos","sentiment_score":0.8,"confidence":0.9,"categories":["team"]},{"sentiment_label":"neg","sentiment_score":-0.7,"confidence":0.8,"categories":["work"]}]}`))
+	}))
+	defer server.Close()
+	results, err := New(server.URL, time.Second).AnalyzeMany(context.Background(), []string{"ดี", "แย่"})
+	if err != nil || len(results) != 2 || results[0].SentimentLabel != "pos" || results[1].SentimentLabel != "neg" {
+		t.Fatalf("unexpected results: %+v, %v", results, err)
+	}
+}
+
 func TestKeywordsPreservesResponseOrder(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/keywords" {

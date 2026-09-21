@@ -76,6 +76,9 @@ type TrendPoint struct {
 	Month        string  `json:"month"`
 	Enps         int     `json:"enps"`
 	Satisfaction float64 `json:"satisfaction"`
+	ResponseRate int     `json:"responseRate"`
+	BurnoutRisk  int     `json:"burnoutRisk"`
+	HasResponses bool    `json:"hasResponses"`
 }
 
 // HrKpis mirrors the frontend's HrKpis type.
@@ -91,7 +94,10 @@ type HrKpis struct {
 func NewTrend(points []analytics.TrendPoint) []TrendPoint {
 	out := make([]TrendPoint, 0, len(points))
 	for _, p := range points {
-		out = append(out, TrendPoint{Month: p.Month, Enps: p.ENPS, Satisfaction: p.Satisfaction})
+		out = append(out, TrendPoint{
+			Month: p.Month, Enps: p.ENPS, Satisfaction: p.Satisfaction,
+			ResponseRate: p.ResponseRate, BurnoutRisk: p.BurnoutRisk, HasResponses: p.HasResponses,
+		})
 	}
 	return out
 }

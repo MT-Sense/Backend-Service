@@ -214,6 +214,19 @@ type SurveyResponse struct {
 
 func (SurveyResponse) TableName() string { return "survey_responses" }
 
+// SurveyImport records a completed workbook so the same file cannot be imported twice
+// into one survey period. It contains no employee or response identifiers.
+type SurveyImport struct {
+	ID        string    `gorm:"column:id;primaryKey;size:64"`
+	OrgID     string    `gorm:"column:org_id;size:64;not null;uniqueIndex:uq_survey_import_file,priority:1"`
+	PeriodID  string    `gorm:"column:period_id;size:64;not null;uniqueIndex:uq_survey_import_file,priority:2"`
+	FileHash  string    `gorm:"column:file_hash;size:64;not null;uniqueIndex:uq_survey_import_file,priority:3"`
+	RowCount  int       `gorm:"column:row_count;not null"`
+	CreatedAt time.Time `gorm:"column:created_at;not null"`
+}
+
+func (SurveyImport) TableName() string { return "survey_imports" }
+
 type ResponseAnalysis struct {
 	ID             string  `gorm:"column:id;primaryKey;size:64" json:"id"`
 	ResponseID     string  `gorm:"column:response_id;size:64;not null;uniqueIndex" json:"-"`
@@ -385,9 +398,8 @@ type PublishedSummary struct {
 	PublishedAt string    `gorm:"size:32" json:"publishedAt"`
 }
 
-// AIInsight stores the output of the analysis pipeline. Rows are written by that pipeline,
-// never computed per-request.
-// ponytail: seeded rows stand in for a real LLM pass; swap the seeder for the pipeline writer.
+// AIInsight stores the period summary derived from AI-analyzed responses. The dashboard
+// refreshes this row on demand so an open period stays current as responses arrive.
 type AIInsight struct {
 	ID              uint              `gorm:"primaryKey" json:"-"`
 	OrgID           string            `gorm:"size:64;index" json:"-"`
@@ -464,7 +476,7 @@ func AllModels() []any {
 		&User{},
 		&Topic{},
 		&SurveyPeriod{},
-		&SurveySubmission{}, &SurveyResponse{},
+		&SurveySubmission{}, &SurveyResponse{}, &SurveyImport{},
 		&ResponseAnalysis{}, &ExtraAnswer{},
 		&DashboardMetrics{}, &PositionScore{}, &KeywordMonthly{},
 		&Alert{}, &KnowledgeBaseSummary{},
