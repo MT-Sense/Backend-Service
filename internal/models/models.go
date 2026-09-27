@@ -497,5 +497,7 @@ func AllModels() []any {
 		&AIInsight{}, &UrgentIssue{}, &DecisionItem{}, &WordCloudTerm{},
 		&TopicSubIssue{}, &TopicSampleQuote{},
 		&RefreshToken{},
+		&AutomationSettings{}, &AutomationProposal{}, &AutomationEvent{},
+		&RoutingPolicy{}, &RoutingCase{},
 	}
 }

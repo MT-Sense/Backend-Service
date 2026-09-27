@@ -161,6 +161,17 @@ Auth: `Authorization: Bearer <accessToken>` ทุก endpoint ยกเว้�
 | GET | `/api/dashboard/hr/topics/:id` |
 | GET/POST | `/api/survey-periods` | list / เปิดรอบใหม่ |
 | POST | `/api/survey-periods/:id/close` | ปิดรอบ + คำนวณ alerts |
+| POST | `/api/survey-periods/:id/import/preview` | ตรวจไฟล์ Excel และ Department โดยยังไม่บันทึก |
+| POST | `/api/survey-periods/:id/import` | วิเคราะห์และนำเข้าคำตอบจาก Excel แบบครบทั้งไฟล์ |
+
+หน้า **รอบสำรวจ** ให้ HR เลือกไฟล์ `.xlsx` ในรอบที่ต้องการ (ไม่เกิน 5 MB/250 แถว)
+แผ่นงานแรกต้องมีหัวคอลัมน์เรียง A–D: `Department`, `ตำแหน่ง`, `คะแนน`, `ข้อความ`
+โดยคะแนนเป็นจำนวนเต็ม 1–5, ข้อความต้องไม่ว่าง และชื่อ Department ต้องตรงกับแผนกในองค์กร
+ระบบตรวจทุกแถวก่อน ให้ยืนยันจำนวนคำตอบต่อแผนก แล้วจึงลบข้อมูลระบุตัวตนจากข้อความ
+ส่งข้อความที่ปกปิดแล้วไป AI-Service และบันทึกคำตอบพร้อมผลวิเคราะห์ใน transaction เดียว
+คอลัมน์ตำแหน่งอ่านเพื่อคงรูปแบบไฟล์ แต่ยังไม่ใช้ในสถิติหรือฐานข้อมูล
+การนำเข้าไม่ผูกคำตอบกับบัญชีผู้ใช้ และไม่เพิ่ม `survey_submissions` จึงไม่ทำเครื่องหมายว่า
+พนักงานคนใดส่งแบบสอบถามแล้ว ไฟล์เดียวกันจะนำเข้าซ้ำในรอบเดียวกันไม่ได้
 | GET | `/api/feed/pending` |
 | PATCH | `/api/feed/:id/moderate` |
 | GET/POST | `/api/hr/departments` | ดูรายชื่อและสร้าง Department ขององค์กร |

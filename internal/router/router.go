@@ -56,6 +56,7 @@ func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) {
 	knowledgeH := handlers.NewKnowledgeBaseHandler(kb)
 	onboardH := handlers.NewOnboardingHandler(db, issuer)
 	departmentsH := handlers.NewDepartmentsHandler(db)
+	automationH := handlers.NewAutomationHandler(db, cfg.AutomationEncryptionKey, cfg.AIServiceURL, cfg.AutomationServiceToken)
 
 	adminOnly := middleware.RequireRole(models.RoleAdmin)
 	execOnly := middleware.RequireRole(models.RoleExecutive)
@@ -135,6 +136,22 @@ func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) {
 	r.Get("/knowledge-base/index", leadership, knowledgeH.Index)
 	r.Post("/knowledge-base/ask", leadership, knowledgeH.Ask)
 	r.Get("/knowledge-base/:periodId", leadership, knowledgeH.Get)
+
+	r.Get("/hr/automation/routing-policy", adminOnly, automationH.RoutingPolicy)
+	r.Patch("/hr/automation/routing-policy", adminOnly, automationH.SaveRoutingPolicy)
+	r.Get("/hr/automation/cases", adminOnly, automationH.ListRoutingCases)
+	r.Post("/hr/automation/cases", adminOnly, onboardingLimiter(20, time.Minute), automationH.CreateRoutingCase)
+	r.Post("/hr/automation/cases/:id", adminOnly, automationH.UpdateRoutingCase)
+	r.Get("/hr/automation/settings", adminOnly, automationH.GetSettings)
+	r.Patch("/hr/automation/settings", adminOnly, automationH.SaveSettings)
+	r.Post("/hr/automation/jira/test", adminOnly, automationH.TestJira)
+	r.Get("/hr/automation/proposals", adminOnly, automationH.ListProposals)
+	r.Post("/hr/automation/generate", adminOnly, onboardingLimiter(5, time.Minute), automationH.Generate)
+	r.Post("/hr/automation/demo", adminOnly, onboardingLimiter(5, time.Minute), automationH.Demo)
+	r.Post("/hr/automation/proposals/:id/review", adminOnly, automationH.Review)
+	r.Post("/hr/automation/proposals/:id/execute", adminOnly, automationH.Execute)
+	r.Post("/hr/automation/proposals/:id/complete", adminOnly, automationH.Complete)
+	r.Get("/hr/automation/proposals/:id/events", adminOnly, automationH.Events)
 
 	// Executive only — aggregates, no raw text by construction.
 	r.Get("/dashboard/executive/summary", execOnly, dashH.ExecutiveSummary)
