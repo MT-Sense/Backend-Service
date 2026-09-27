@@ -333,14 +333,26 @@ type Alert struct {
 
 func (Alert) TableName() string { return "alerts" }
 
-// KnowledgeBaseSummary is created for schema fidelity; nothing writes to it this pass
-// (no RAG/Q&A pipeline yet).
+// KnowledgeBaseSummary is the persistent, compiled wiki article for one survey period.
+// It stores only aggregate, privacy-safe knowledge; raw employee comments never enter this
+// table. SourceHash makes compilation incremental: unchanged evidence reuses the article.
 type KnowledgeBaseSummary struct {
-	ID          string    `gorm:"column:id;primaryKey;size:64" json:"id"`
-	OrgID       string    `gorm:"column:org_id;size:64;not null;index" json:"-"`
-	PeriodID    string    `gorm:"column:period_id;size:64;not null;index" json:"-"`
-	SummaryText string    `gorm:"column:summary_text;type:text;not null" json:"summaryText"`
-	CreatedAt   time.Time `gorm:"column:created_at" json:"createdAt"`
+	ID                 string    `gorm:"column:id;primaryKey;size:64" json:"id"`
+	OrgID              string    `gorm:"column:org_id;size:64;not null;index;uniqueIndex:uq_kb_org_period,priority:1" json:"-"`
+	PeriodID           string    `gorm:"column:period_id;size:64;not null;index;uniqueIndex:uq_kb_org_period,priority:2" json:"periodId"`
+	TitleTH            string    `gorm:"column:title_th;type:text;not null;default:''" json:"titleTh"`
+	TitleEN            string    `gorm:"column:title_en;type:text;not null;default:''" json:"titleEn"`
+	SummaryText        string    `gorm:"column:summary_text;type:text;not null" json:"summaryText"`
+	SummaryEN          string    `gorm:"column:summary_en;type:text;not null;default:''" json:"summaryEn"`
+	MarkdownText       string    `gorm:"column:markdown_text;type:text;not null;default:''" json:"markdown"`
+	Tags               []string  `gorm:"column:tags;serializer:json" json:"tags"`
+	RelatedPeriodIDs   []string  `gorm:"column:related_period_ids;serializer:json" json:"relatedPeriodIds"`
+	SuggestedQuestions []string  `gorm:"column:suggested_questions;serializer:json" json:"suggestedQuestions"`
+	SourceHash         string    `gorm:"column:source_hash;size:64;not null;default:'';index" json:"sourceHash"`
+	SourceSnapshot     string    `gorm:"column:source_snapshot;type:text;not null;default:''" json:"-"`
+	CompiledAt         time.Time `gorm:"column:compiled_at" json:"compiledAt"`
+	CreatedAt          time.Time `gorm:"column:created_at" json:"createdAt"`
+	UpdatedAt          time.Time `gorm:"column:updated_at" json:"updatedAt"`
 }
 
 func (KnowledgeBaseSummary) TableName() string { return "knowledge_base_summaries" }

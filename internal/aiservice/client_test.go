@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -94,6 +95,107 @@ func TestKeywordsPreservesResponseOrder(t *testing.T) {
 	}
 	if len(keywords) != 2 || keywords[0][0] != "ระบบ" || keywords[1][0] != "ทีม" {
 		t.Fatalf("unexpected keywords: %v", keywords)
+	}
+}
+
+func TestCompileKnowledgeUsesAggregateContract(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/knowledge/compile" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		var request KnowledgeCompileRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.Source.PeriodLabel != "2026-09" || request.Source.TotalResponses != 12 {
+			t.Fatalf("unexpected source: %+v", request.Source)
+		}
+		if len(request.PreviousArticles) != 1 || request.PreviousArticles[0].PeriodID != "aug" {
+			t.Fatalf("unexpected previous articles: %+v", request.PreviousArticles)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"title_th":"สรุป 2026-09",
+			"title_en":"Summary 2026-09",
+			"summary_th":"คะแนนเฉลี่ย 3.8/5",
+			"summary_en":"Average satisfaction is 3.8/5",
+			"markdown":"# สรุป 2026-09",
+			"tags":["work"],
+			"related_period_ids":["aug"],
+			"suggested_questions":["อะไรเปลี่ยนไป?"]
+		}`))
+	}))
+	defer server.Close()
+
+	request := KnowledgeCompileRequest{
+		Source: KnowledgeSource{
+			PeriodID:            "sep",
+			PeriodLabel:         "2026-09",
+			TotalResponses:      12,
+			AverageSatisfaction: 3.8,
+		},
+		PreviousArticles: []PreviousKnowledgeArticle{{PeriodID: "aug", PeriodLabel: "2026-08"}},
+	}
+	result, err := New(server.URL, time.Second).CompileKnowledge(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TitleTH != "สรุป 2026-09" || len(result.RelatedPeriodIDs) != 1 {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+}
+
+func TestCompileKnowledgeRejectsIncompleteArticle(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"title_th":"only a title"}`))
+	}))
+	defer server.Close()
+
+	_, err := New(server.URL, time.Second).CompileKnowledge(context.Background(), KnowledgeCompileRequest{})
+	if err == nil {
+		t.Fatal("expected incomplete knowledge article to be rejected")
+	}
+}
+
+func TestAskKnowledgeForwardsPrivacySafeEvidence(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/knowledge/ask" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		var request KnowledgeQARequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.Question != "แนวโน้ม workload เป็นอย่างไร" || request.Locale != "th" {
+			t.Fatalf("unexpected request: %+v", request)
+		}
+		if len(request.Articles) != 1 || request.Articles[0].PeriodLabel != "2026-09" {
+			t.Fatalf("unexpected articles: %+v", request.Articles)
+		}
+		if !strings.Contains(string(request.Articles[0].SourceSnapshot), "average_satisfaction") {
+			t.Fatalf("source snapshot missing: %s", request.Articles[0].SourceSnapshot)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"answer":"คะแนนเฉลี่ยอยู่ที่ 3.8/5","used_period_ids":["sep"]}`))
+	}))
+	defer server.Close()
+
+	result, err := New(server.URL, time.Second).AskKnowledge(context.Background(), KnowledgeQARequest{
+		Question: "แนวโน้ม workload เป็นอย่างไร",
+		Locale:   "th",
+		Articles: []KnowledgeQAArticle{{
+			PeriodID:       "sep",
+			PeriodLabel:    "2026-09",
+			Title:          "สรุป",
+			Summary:        "ภาพรวม",
+			SourceSnapshot: json.RawMessage(`{"average_satisfaction":3.8}`),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Answer == "" || len(result.UsedPeriodIDs) != 1 || result.UsedPeriodIDs[0] != "sep" {
+		t.Fatalf("unexpected result: %+v", result)
 	}
 }
 

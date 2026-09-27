@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"errors"
+	"log"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -10,6 +12,7 @@ import (
 	"github.com/mt-sense/backend-service/internal/aiservice"
 	"github.com/mt-sense/backend-service/internal/analytics"
 	"github.com/mt-sense/backend-service/internal/dto"
+	"github.com/mt-sense/backend-service/internal/knowledgebase"
 	"github.com/mt-sense/backend-service/internal/middleware"
 	"github.com/mt-sense/backend-service/internal/models"
 )
@@ -20,10 +23,11 @@ type PeriodsHandler struct {
 	db    *gorm.DB
 	stats *analytics.Service
 	ai    *aiservice.Client
+	kb    *knowledgebase.Service
 }
 
-func NewPeriodsHandler(db *gorm.DB, stats *analytics.Service, ai *aiservice.Client) *PeriodsHandler {
-	return &PeriodsHandler{db: db, stats: stats, ai: ai}
+func NewPeriodsHandler(db *gorm.DB, stats *analytics.Service, ai *aiservice.Client, kb *knowledgebase.Service) *PeriodsHandler {
+	return &PeriodsHandler{db: db, stats: stats, ai: ai, kb: kb}
 }
 
 // List returns every survey period for the org, newest first, with response counts.
@@ -104,6 +108,14 @@ func (h *PeriodsHandler) Close(c *fiber.Ctx) error {
 
 	if err := stats.GenerateAlerts(&period); err != nil {
 		return err
+	}
+
+	// Knowledge compilation is best-effort here: closing a survey must not depend on an
+	// external LLM being available. HR can retry explicitly via /api/knowledge-base/:id/compile.
+	if h.kb != nil {
+		if _, _, err := h.kb.CompilePeriod(c.UserContext(), orgID, period.ID, false); err != nil && !errors.Is(err, knowledgebase.ErrInsufficientData) {
+			log.Printf("knowledge compilation after period close failed for %s: %v", period.ID, err)
+		}
 	}
 
 	n, err := stats.TotalRespondents(period.ID)

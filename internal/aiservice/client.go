@@ -22,6 +22,80 @@ type Result struct {
 	Reason         string   `json:"reason"`
 }
 
+type KnowledgeTopic struct {
+	ID                  string  `json:"id"`
+	Label               string  `json:"label"`
+	AverageSatisfaction float64 `json:"average_satisfaction"`
+	MentionCount        int64   `json:"mention_count"`
+}
+
+type KnowledgeDepartment struct {
+	ID                  string  `json:"id"`
+	Name                string  `json:"name"`
+	AverageSatisfaction float64 `json:"average_satisfaction"`
+	ResponseCount       int64   `json:"response_count"`
+}
+
+type KnowledgeSource struct {
+	PeriodID            string                `json:"period_id"`
+	PeriodLabel         string                `json:"period_label"`
+	TotalResponses      int64                 `json:"total_responses"`
+	AverageSatisfaction float64               `json:"average_satisfaction"`
+	Sentiment           *KnowledgeSentiment   `json:"sentiment,omitempty"`
+	Topics              []KnowledgeTopic      `json:"topics"`
+	Departments         []KnowledgeDepartment `json:"departments"`
+}
+
+type KnowledgeSentiment struct {
+	Positive int `json:"positive"`
+	Neutral  int `json:"neutral"`
+	Negative int `json:"negative"`
+	Analyzed int `json:"analyzed"`
+}
+
+type PreviousKnowledgeArticle struct {
+	PeriodID    string `json:"period_id"`
+	PeriodLabel string `json:"period_label"`
+	TitleTH     string `json:"title_th"`
+	SummaryTH   string `json:"summary_th"`
+}
+
+type KnowledgeCompileRequest struct {
+	Source           KnowledgeSource            `json:"source"`
+	PreviousArticles []PreviousKnowledgeArticle `json:"previous_articles"`
+}
+
+type KnowledgeCompileResult struct {
+	TitleTH            string   `json:"title_th"`
+	TitleEN             string   `json:"title_en"`
+	SummaryTH           string   `json:"summary_th"`
+	SummaryEN           string   `json:"summary_en"`
+	Markdown            string   `json:"markdown"`
+	Tags                []string `json:"tags"`
+	RelatedPeriodIDs    []string `json:"related_period_ids"`
+	SuggestedQuestions []string `json:"suggested_questions"`
+}
+
+type KnowledgeQAArticle struct {
+	PeriodID      string          `json:"period_id"`
+	PeriodLabel   string          `json:"period_label"`
+	Title         string          `json:"title"`
+	Summary       string          `json:"summary"`
+	Tags          []string        `json:"tags"`
+	SourceSnapshot json.RawMessage `json:"source_snapshot"`
+}
+
+type KnowledgeQARequest struct {
+	Question string               `json:"question"`
+	Articles []KnowledgeQAArticle `json:"articles"`
+	Locale   string               `json:"locale"`
+}
+
+type KnowledgeQAResult struct {
+	Answer        string   `json:"answer"`
+	UsedPeriodIDs []string `json:"used_period_ids"`
+}
+
 type Client struct {
 	url     string
 	baseURL string
@@ -172,6 +246,75 @@ func (c *Client) Keywords(ctx context.Context, texts []string) ([][]string, erro
 		return nil, errors.New("AI keyword service returned an unexpected number of results")
 	}
 	return payload.Keywords, nil
+}
+
+func (c *Client) CompileKnowledge(ctx context.Context, request KnowledgeCompileRequest) (*KnowledgeCompileResult, error) {
+	body, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/knowledge/compile", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 2 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("AI knowledge compile request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		var payload struct {
+			Detail string `json:"detail"`
+		}
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&payload)
+		if payload.Detail == "" {
+			payload.Detail = http.StatusText(resp.StatusCode)
+		}
+		return nil, fmt.Errorf("AI knowledge compiler returned status %d: %s", resp.StatusCode, payload.Detail)
+	}
+	var result KnowledgeCompileResult
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&result); err != nil {
+		return nil, fmt.Errorf("invalid AI knowledge response: %w", err)
+	}
+	if strings.TrimSpace(result.TitleTH) == "" || strings.TrimSpace(result.TitleEN) == "" ||
+		strings.TrimSpace(result.SummaryTH) == "" || strings.TrimSpace(result.SummaryEN) == "" ||
+		strings.TrimSpace(result.Markdown) == "" {
+		return nil, errors.New("AI knowledge compiler returned an incomplete article")
+	}
+	return &result, nil
+}
+
+func (c *Client) AskKnowledge(ctx context.Context, request KnowledgeQARequest) (*KnowledgeQAResult, error) {
+	body, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/knowledge/ask", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 2 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("AI knowledge Q&A request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		var payload struct { Detail string `json:"detail"` }
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&payload)
+		return nil, fmt.Errorf("AI knowledge Q&A returned status %d: %s", resp.StatusCode, payload.Detail)
+	}
+	var result KnowledgeQAResult
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&result); err != nil {
+		return nil, fmt.Errorf("invalid AI knowledge Q&A response: %w", err)
+	}
+	if strings.TrimSpace(result.Answer) == "" {
+		return nil, errors.New("AI knowledge Q&A returned an empty answer")
+	}
+	return &result, nil
 }
 
 func validCategory(category string) bool {

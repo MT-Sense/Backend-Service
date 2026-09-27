@@ -179,6 +179,14 @@ HR เปลี่ยนชื่อ Department ได้จากหน้า `
 ### admin หรือ Executive
 `POST /api/action-items` — Executive ได้ level `decision`, admin ได้ `full`
 
+Knowledge Base (aggregate-only):
+- `GET /api/knowledge-base` — index metadata ของบทความแต่ละรอบ
+- `GET /api/knowledge-base/index` — Markdown index พร้อม wikilinks `[[YYYY-MM]]`
+- `GET /api/knowledge-base/:periodId` — บทความ Markdown เต็มของรอบนั้น
+
+admin เพิ่มเติม: `POST /api/knowledge-base/:periodId/compile?force=false` เพื่อ compile/recompile บทความด้วย LLM
+ระบบจะลอง compile อัตโนมัติเมื่อปิดรอบสำรวจด้วย แต่ถ้า AI-Service ไม่พร้อม การปิดรอบยังสำเร็จและ HR สามารถ retry endpoint นี้ภายหลังได้
+
 ทุก dashboard endpoint รับ `?period=<periodId>` (default = รอบล่าสุดขององค์กร)
 
 ---
@@ -196,7 +204,8 @@ internal/
   middleware/        RequireAuth (คุณคือใคร) / RequireRole (เข้าอะไรได้)
   privacy/           n<5 + PII redaction  ← มี test
   analytics/         aggregation SQL ทั้งหมด (n<5 อยู่ใน HAVING) + alerts.go
-  handlers/          auth, dashboard, survey, feed, periods
+  knowledgebase/     compile aggregate → persistent Markdown article + index/backlinks/source hash
+  handlers/          auth, dashboard, survey, feed, periods, knowledgebase
   router/            ตารางสิทธิ์ทั้งหมดอยู่ที่นี่ไฟล์เดียว
 ```
 
@@ -224,8 +233,7 @@ go vet ./...
 go build ./...
 ```
 
-> หมายเหตุ: สภาพแวดล้อมที่ใช้เขียน migration ครั้งนี้ไม่มี Go toolchain ติดตั้งอยู่ — โค้ดผ่านการ
-> รีวิวอย่างละเอียดด้วยมือแต่ **ยังไม่ได้ build/test จริง** รันคำสั่งด้านบนก่อนใช้งานจริงเสมอ
+> ชุดงาน Knowledge Base ทดสอบด้วย `go test ./...`, `go vet ./...` และ PostgreSQL integration test บนฐานข้อมูลชั่วคราวแล้ว
 
 Seed จะข้ามถ้ามีข้อมูลอยู่แล้ว (เช็คจากตาราง `organizations`) ล้างใหม่:
 
@@ -248,7 +256,7 @@ dropdb mtsense && createdb mtsense && go run ./cmd/server
 - **สูตร burnout risk** — ตอนนี้ใช้ heuristic (สัดส่วนคนที่ให้คะแนนรวม ≤2) เพราะสเปกยังไม่ได้สรุปสูตร
 - **`dashboard_metrics`/`position_scores`/`keywords_monthly`** — ตารางมีอยู่ตาม schema ที่กำหนด
   แต่ยังไม่มี batch job เขียนลงไป analytics ทั้งหมดยัง query สดเหมือนเดิม
-- **`knowledge_base_summaries`** — สร้างตารางไว้เฉยๆ ยังไม่มี RAG/Q&A pipeline
+- **Q&A บน Knowledge Base** — รอบนี้ทำ persistent LLM summary/wiki article, index และ backlinks แล้ว แต่ยังไม่มีหน้าถาม-ตอบหรือ retrieval orchestration; ให้ต่อยอดจาก `/api/knowledge-base` โดยไม่ต้องอ่านความคิดเห็นดิบใหม่
 - **Cache** — dashboard ที่ aggregate หนักยัง query สดทุกครั้ง ตามสเปกควร cache รายวัน
 - **Rate limiting** ที่ `/api/auth/login`
 - **Multi-tenant login จริง** — org_id ผูกทุก query แล้ว แต่ยังไม่มีหน้าเลือกบริษัทก่อน login

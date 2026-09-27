@@ -12,6 +12,7 @@ import (
 	"github.com/mt-sense/backend-service/internal/auth"
 	"github.com/mt-sense/backend-service/internal/config"
 	"github.com/mt-sense/backend-service/internal/handlers"
+	"github.com/mt-sense/backend-service/internal/knowledgebase"
 	"github.com/mt-sense/backend-service/internal/middleware"
 	"github.com/mt-sense/backend-service/internal/models"
 )
@@ -44,13 +45,15 @@ func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) {
 	issuer := auth.NewIssuer(cfg.JWTSecret, cfg.AccessTTL, cfg.RefreshTTL)
 	stats := analytics.New(db)
 	ai := aiservice.New(cfg.AIServiceURL, 25*time.Second)
+	kb := knowledgebase.New(db, ai)
 
 	authH := handlers.NewAuthHandler(db, issuer)
 	dashH := handlers.NewDashboardHandler(db, stats, ai)
 	surveyH := handlers.NewSurveyHandler(db, stats, ai)
 	trainingH := handlers.NewModelTrainingHandler(db, ai, cfg.AITrainingToken)
 	feedH := handlers.NewFeedHandler(db, cfg.JWTSecret)
-	periodsH := handlers.NewPeriodsHandler(db, stats, ai)
+	periodsH := handlers.NewPeriodsHandler(db, stats, ai, kb)
+	knowledgeH := handlers.NewKnowledgeBaseHandler(kb)
 	onboardH := handlers.NewOnboardingHandler(db, issuer)
 	departmentsH := handlers.NewDepartmentsHandler(db)
 
@@ -125,6 +128,13 @@ func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) {
 	r.Post("/org/join-code/regenerate", adminOnly, onboardH.RegenerateJoinCode)
 	r.Get("/org/settings", adminOnly, onboardH.GetOrgSettings)
 	r.Patch("/org/settings", adminOnly, onboardH.UpdateOrgSettings)
+	r.Post("/knowledge-base/:periodId/compile", adminOnly, knowledgeH.Compile)
+
+	// Compiled knowledge contains aggregates only, so HR and executives can browse it.
+	r.Get("/knowledge-base", leadership, knowledgeH.List)
+	r.Get("/knowledge-base/index", leadership, knowledgeH.Index)
+	r.Post("/knowledge-base/ask", leadership, knowledgeH.Ask)
+	r.Get("/knowledge-base/:periodId", leadership, knowledgeH.Get)
 
 	// Executive only — aggregates, no raw text by construction.
 	r.Get("/dashboard/executive/summary", execOnly, dashH.ExecutiveSummary)
