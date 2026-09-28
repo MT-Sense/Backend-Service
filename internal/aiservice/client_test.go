@@ -50,6 +50,21 @@ func TestAnalyzeRejectsUnknownDashboardCategory(t *testing.T) {
 	}
 }
 
+func TestAnalyzeAcceptsStructuredEmergingTopic(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"results":[{"sentiment_label":"neu","sentiment_score":0,"confidence":0.8,"categories":[],"emerging_topics":[{"label_th":"คุณภาพเครื่องมือภายใน","label_en":"Internal tool quality"}]}]}`))
+	}))
+	defer server.Close()
+
+	result, err := New(server.URL, time.Second).Analyze(context.Background(), "ระบบภายในช้า")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.EmergingTopics) != 1 || result.EmergingTopics[0].LabelTH != "คุณภาพเครื่องมือภายใน" {
+		t.Fatalf("unexpected emerging topics: %+v", result.EmergingTopics)
+	}
+}
+
 func TestAnalyzeManyPreservesOrder(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request struct {

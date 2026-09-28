@@ -198,16 +198,36 @@ func TestEmptyCollectionsSerializeAsArrays(t *testing.T) {
 	}
 }
 
-func TestUpdateSettingsOnlyAllowsNotificationColumns(t *testing.T) {
+func TestUpdateSettingsUsesExplicitAllowList(t *testing.T) {
 	yes := true
-	req := UpdateSettingsRequest{NotifyNewRound: &yes}
+	name := "  Jane Doe  "
+	req := UpdateSettingsRequest{FullName: &name, NotifyNewRound: &yes}
+	req.Normalize()
+	if problems := req.Validate(); len(problems) != 0 {
+		t.Fatalf("valid settings rejected: %v", problems)
+	}
 	updates := req.Updates()
 
-	if len(updates) != 1 || updates["notify_new_round"] != true {
-		t.Errorf("updates = %v, want only notify_new_round", updates)
+	if len(updates) != 2 || updates["full_name"] != "Jane Doe" || updates["notify_new_round"] != true {
+		t.Errorf("updates = %v, want only full_name + notify_new_round", updates)
 	}
 	// Nothing supplied means nothing written — the handler turns this into a 400.
 	if got := (&UpdateSettingsRequest{}).Updates(); len(got) != 0 {
 		t.Errorf("empty request produced updates: %v", got)
+	}
+}
+
+func TestUpdateSettingsValidatesFullName(t *testing.T) {
+	empty := "   "
+	req := UpdateSettingsRequest{FullName: &empty}
+	req.Normalize()
+	if problems := req.Validate(); len(problems) == 0 {
+		t.Fatal("blank fullName should be rejected")
+	}
+
+	long := strings.Repeat("ก", 101)
+	req = UpdateSettingsRequest{FullName: &long}
+	if problems := req.Validate(); len(problems) == 0 {
+		t.Fatal("fullName longer than 100 characters should be rejected")
 	}
 }

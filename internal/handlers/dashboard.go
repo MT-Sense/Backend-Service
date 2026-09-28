@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"math"
 	"sort"
 	"strings"
@@ -179,6 +180,18 @@ func (h *DashboardHandler) Heatmap(c *fiber.Ctx) error {
 	var topics []models.Topic
 	if err := h.db.Order("sort_order, id").Find(&topics).Error; err != nil {
 		return err
+	}
+	emerging, err := stats.VisibleEmergingTopics(period.ID)
+	if err != nil {
+		return err
+	}
+	emergingSortStart := len(topics)
+	for index, topic := range emerging {
+		topics = append(topics, models.Topic{
+			ID:        topic.ID,
+			Label:     topic.Label,
+			SortOrder: emergingSortStart + index,
+		})
 	}
 
 	scores, err := stats.DepartmentTopicScores(period.ID)
@@ -509,9 +522,19 @@ func (h *DashboardHandler) TopicDrilldown(c *fiber.Ctx) error {
 	}
 	topicID := c.Params("id")
 
+	var topicLabel models.Localized
 	var topic models.Topic
-	if err := h.db.First(&topic, "id = ?", topicID).Error; err != nil {
-		return fiber.NewError(fiber.StatusNotFound, "unknown topic")
+	if err := h.db.First(&topic, "id = ?", topicID).Error; err == nil {
+		topicLabel = topic.Label
+	} else {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		var emerging models.EmergingTopic
+		if err := h.db.Where("org_id = ? AND id = ?", orgID, topicID).First(&emerging).Error; err != nil {
+			return fiber.NewError(fiber.StatusNotFound, "unknown topic")
+		}
+		topicLabel = emerging.Label
 	}
 	if departmentID := c.Query("department"); departmentID != "" {
 		departmentName := "Unassigned"
@@ -530,7 +553,7 @@ func (h *DashboardHandler) TopicDrilldown(c *fiber.Ctx) error {
 			return fiber.NewError(fiber.StatusNotFound, "department topic data is hidden or unavailable")
 		}
 		return c.JSON(dto.TopicDrilldown{
-			TopicID: topicID, Label: topic.Label,
+			TopicID: topicID, Label: topicLabel,
 			DepartmentID: departmentID, DepartmentName: departmentName,
 			Score: detail.Score, CompanyAverage: detail.CompanyAverage,
 			RespondentCount: detail.RespondentCount, PercentageTagged: detail.PercentageTagged,
@@ -567,7 +590,7 @@ func (h *DashboardHandler) TopicDrilldown(c *fiber.Ctx) error {
 
 	return c.JSON(dto.TopicDrilldown{
 		TopicID:          topicID,
-		Label:            topic.Label,
+		Label:            topicLabel,
 		Score:            stats.Score,
 		CompanyAverage:   stats.CompanyAverage,
 		RespondentCount:  stats.RespondentCount,

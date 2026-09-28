@@ -298,6 +298,7 @@ func seedResponses(tx *gorm.DB, orgID string, periods []models.SurveyPeriod) err
 					DepartmentID:      &deptID,
 					PositionID:        &posID,
 					SatisfactionScore: int16(score + 0.5),
+					AnalysisStatus:    "skipped",
 					SubmittedAt:       period.OpensAt.AddDate(0, 0, rng.Intn(20)),
 				}
 
@@ -306,6 +307,7 @@ func seedResponses(tx *gorm.DB, orgID string, periods []models.SurveyPeriod) err
 				if rng.Intn(5) == 0 {
 					text := openTextSamples[rng.Intn(len(openTextSamples))]
 					response.CommentText = text
+					response.AnalysisStatus = "analyzed"
 
 					// Weight category selection toward the department's weaker topics so
 					// the heatmap/word-cloud/topic-drilldown seed data looks plausible.

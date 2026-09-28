@@ -208,6 +208,13 @@ type SurveyResponse struct {
 	// CommentText holds the open-ended comment AFTER PII redaction — raw text is never
 	// persisted (see privacy.Redact, called before this struct is built).
 	CommentText string `gorm:"column:comment_text;type:text" json:"commentText,omitempty"`
+	// AnalysisStatus drives the anonymous background queue. It never contains a user id;
+	// the queue works only with this response id and the already-redacted comment.
+	AnalysisStatus        string     `gorm:"column:analysis_status;size:16;not null;default:pending;index" json:"-"`
+	AnalysisAttempts      int        `gorm:"column:analysis_attempts;not null;default:0" json:"-"`
+	AnalysisLastError     string     `gorm:"column:analysis_last_error;type:text" json:"-"`
+	AnalysisNextAttemptAt *time.Time `gorm:"column:analysis_next_attempt_at;index" json:"-"`
+	AnalysisStartedAt     *time.Time `gorm:"column:analysis_started_at;index" json:"-"`
 
 	SubmittedAt time.Time `gorm:"column:submitted_at;not null;index" json:"submittedAt"`
 }
@@ -246,6 +253,32 @@ type ResponseAnalysis struct {
 }
 
 func (ResponseAnalysis) TableName() string { return "response_analysis" }
+
+// EmergingTopic is an organization-scoped topic discovered from feedback that does not fit
+// the stable six-topic taxonomy. It is kept separate so the executive radar remains
+// comparable across months while the HR heatmap can grow with new subjects.
+type EmergingTopic struct {
+	ID              string    `gorm:"column:id;primaryKey;size:64" json:"id"`
+	OrgID           string    `gorm:"column:org_id;size:64;not null;index;uniqueIndex:uq_emerging_topics_org_label,priority:1" json:"-"`
+	NormalizedLabel string    `gorm:"column:normalized_label;size:120;not null;uniqueIndex:uq_emerging_topics_org_label,priority:2" json:"-"`
+	Label           Localized `gorm:"column:label;serializer:json" json:"label"`
+	CreatedAt       time.Time `gorm:"column:created_at;not null" json:"-"`
+}
+
+func (EmergingTopic) TableName() string {
+	return "emerging_topics"
+}
+
+// ResponseEmergingTopic links an anonymous response to an organization-scoped discovered
+// topic. The table contains no user id and is covered by the same n>=5 reporting gates.
+type ResponseEmergingTopic struct {
+	ResponseID      string `gorm:"column:response_id;size:64;primaryKey" json:"-"`
+	EmergingTopicID string `gorm:"column:emerging_topic_id;size:64;primaryKey;index" json:"-"`
+}
+
+func (ResponseEmergingTopic) TableName() string {
+	return "response_emerging_topics"
+}
 
 // ExtraAnswer stores one answer to one of the fixed, optional questions in
 // dto.ExtraQuestionCatalog, attached to a SurveyResponse. Same anonymity guarantee as
@@ -489,7 +522,7 @@ func AllModels() []any {
 		&Topic{},
 		&SurveyPeriod{},
 		&SurveySubmission{}, &SurveyResponse{}, &SurveyImport{},
-		&ResponseAnalysis{}, &ExtraAnswer{},
+		&ResponseAnalysis{}, &EmergingTopic{}, &ResponseEmergingTopic{}, &ExtraAnswer{},
 		&DashboardMetrics{}, &PositionScore{}, &KeywordMonthly{},
 		&Alert{}, &KnowledgeBaseSummary{},
 		&FeedPost{}, &FeedVote{},

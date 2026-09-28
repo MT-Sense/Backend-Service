@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"log"
 	"strings"
 	"time"
 
@@ -9,7 +8,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
-	"github.com/mt-sense/backend-service/internal/aiservice"
+	"github.com/mt-sense/backend-service/internal/analysisqueue"
 	"github.com/mt-sense/backend-service/internal/analytics"
 	"github.com/mt-sense/backend-service/internal/dto"
 	"github.com/mt-sense/backend-service/internal/middleware"
@@ -20,11 +19,11 @@ import (
 type SurveyHandler struct {
 	db    *gorm.DB
 	stats *analytics.Service
-	ai    *aiservice.Client
+	queue *analysisqueue.Service
 }
 
-func NewSurveyHandler(db *gorm.DB, stats *analytics.Service, ai *aiservice.Client) *SurveyHandler {
-	return &SurveyHandler{db: db, stats: stats, ai: ai}
+func NewSurveyHandler(db *gorm.DB, stats *analytics.Service, queue *analysisqueue.Service) *SurveyHandler {
+	return &SurveyHandler{db: db, stats: stats, queue: queue}
 }
 
 // Current returns the currently open survey period, if any, and whether the caller already
@@ -108,9 +107,9 @@ func (h *SurveyHandler) Submit(c *fiber.Ctx) error {
 		PositionID:        user.PositionID,
 		SatisfactionScore: int16(req.SatisfactionScore),
 		SubmittedAt:       now,
+		AnalysisStatus:    "skipped",
 	}
 
-	var analysis *models.ResponseAnalysis
 	var feedPost *models.FeedPost
 
 	comment := strings.TrimSpace(req.CommentText)
@@ -120,41 +119,16 @@ func (h *SurveyHandler) Submit(c *fiber.Ctx) error {
 		response.CommentText = redacted
 
 		if redacted != "" {
-			// The AI service only receives text after PII redaction. If it is down,
-			// leave the submission untouched so we never store unanalysed feedback
-			// while reporting success to the employee.
-			result, err := h.ai.Analyze(c.UserContext(), redacted)
-			if err != nil {
-				log.Printf("survey analysis failed: %v", err)
-				return fiber.NewError(fiber.StatusServiceUnavailable, "text analysis is temporarily unavailable; please try again")
-			}
-
-			analysis = &models.ResponseAnalysis{
-				ID:             uuid.NewString(),
-				ResponseID:     response.ID,
-				SentimentLabel: result.SentimentLabel,
-				SentimentScore: result.SentimentScore,
-				Confidence:     result.Confidence,
-				LowConfidence:  result.LowConfidence,
-				Categories:     result.Categories,
-				Reason:         result.Reason,
-				AnalyzedAt:     now,
-			}
-
-			log.Printf("survey analysis result: %v", result)
+			response.AnalysisStatus = "pending"
 
 			// Gate one of the feed flow: the author opted in. Gate two (moderation) is a
 			// separate HR action, so the post starts unpublished.
 			if req.OptedInToFeed {
-				tags := req.Tags
-				if len(tags) == 0 {
-					tags = result.Categories
-				}
 				feedPost = &models.FeedPost{
 					ID:        uuid.NewString(),
 					OrgID:     orgID,
 					Text:      redacted,
-					Hashtags:  tags,
+					Hashtags:  req.Tags,
 					PostedOn:  now.Format("2006-01-02"),
 					OptedIn:   true,
 					Published: false,
@@ -188,11 +162,6 @@ func (h *SurveyHandler) Submit(c *fiber.Ctx) error {
 		if err := tx.Create(&response).Error; err != nil {
 			return err
 		}
-		if analysis != nil {
-			if err := tx.Create(analysis).Error; err != nil {
-				return err
-			}
-		}
 		if feedPost != nil {
 			if err := tx.Create(feedPost).Error; err != nil {
 				return err
@@ -213,6 +182,9 @@ func (h *SurveyHandler) Submit(c *fiber.Ctx) error {
 	})
 	if err != nil {
 		return err
+	}
+	if response.AnalysisStatus == "pending" {
+		h.queue.Notify()
 	}
 
 	// The receipt confirms the submission, never the submitter.

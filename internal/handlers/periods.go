@@ -10,6 +10,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/mt-sense/backend-service/internal/aiservice"
+	"github.com/mt-sense/backend-service/internal/analysisqueue"
 	"github.com/mt-sense/backend-service/internal/analytics"
 	"github.com/mt-sense/backend-service/internal/dto"
 	"github.com/mt-sense/backend-service/internal/knowledgebase"
@@ -24,10 +25,11 @@ type PeriodsHandler struct {
 	stats *analytics.Service
 	ai    *aiservice.Client
 	kb    *knowledgebase.Service
+	queue *analysisqueue.Service
 }
 
-func NewPeriodsHandler(db *gorm.DB, stats *analytics.Service, ai *aiservice.Client, kb *knowledgebase.Service) *PeriodsHandler {
-	return &PeriodsHandler{db: db, stats: stats, ai: ai, kb: kb}
+func NewPeriodsHandler(db *gorm.DB, stats *analytics.Service, ai *aiservice.Client, kb *knowledgebase.Service, queue *analysisqueue.Service) *PeriodsHandler {
+	return &PeriodsHandler{db: db, stats: stats, ai: ai, kb: kb, queue: queue}
 }
 
 // List returns every survey period for the org, newest first, with response counts.
@@ -104,6 +106,10 @@ func (h *PeriodsHandler) Close(c *fiber.Ctx) error {
 		if err := h.db.Model(&period).Update("closes_at", now).Error; err != nil {
 			return err
 		}
+	}
+	if err := h.queue.FlushPeriod(c.UserContext(), orgID, period.ID); err != nil {
+		log.Printf("analysis queue flush failed while closing period %s: %v", period.ID, err)
+		return fiber.NewError(fiber.StatusServiceUnavailable, "the period is closed, but pending comments could not be analyzed; retry closing the period")
 	}
 
 	if err := stats.GenerateAlerts(&period); err != nil {

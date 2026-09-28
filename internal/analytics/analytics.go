@@ -474,26 +474,50 @@ func (s *Service) DepartmentPeriodScores(periodID string) (map[string]float64, e
 func (s *Service) DepartmentTopicScores(periodID string) ([]DeptTopicScore, error) {
 	var scores []DeptTopicScore
 	err := s.db.Raw(`
+		WITH memberships AS (
+			SELECT response_analysis.response_id, category.value AS topic_id
+			FROM response_analysis
+			CROSS JOIN LATERAL (
+				SELECT DISTINCT value
+				FROM jsonb_array_elements_text(response_analysis.categories::jsonb) AS category(value)
+			) AS category
+			JOIN topics ON topics.id = category.value
+			UNION
+			SELECT response_id, emerging_topic_id AS topic_id
+			FROM response_emerging_topics
+		)
 		SELECT COALESCE(survey_responses.department_id, '__unassigned__') AS department_id,
-		       category.value AS topic_id,
+		       memberships.topic_id,
 		       ROUND(AVG(survey_responses.satisfaction_score)::numeric, 1)::float8 AS score,
 		       COUNT(DISTINCT survey_responses.id) AS respondents
 		FROM survey_responses
-		JOIN response_analysis ON response_analysis.response_id = survey_responses.id
-		CROSS JOIN LATERAL (
-			SELECT DISTINCT value
-			FROM jsonb_array_elements_text(response_analysis.categories::jsonb) AS category(value)
-		) AS category
-		JOIN topics ON topics.id = category.value
-		WHERE survey_responses.period_id = ?
-		GROUP BY COALESCE(survey_responses.department_id, '__unassigned__'), category.value
+		JOIN memberships ON memberships.response_id = survey_responses.id
+		WHERE survey_responses.org_id = ? AND survey_responses.period_id = ?
+		GROUP BY COALESCE(survey_responses.department_id, '__unassigned__'), memberships.topic_id
 		HAVING COUNT(DISTINCT survey_responses.id) >= ?`,
-		periodID, privacy.MinGroupSizeSQL,
+		s.orgID, periodID, privacy.MinGroupSizeSQL,
 	).Scan(&scores).Error
 	if err != nil {
 		return nil, err
 	}
 	return scores, nil
+}
+
+// VisibleEmergingTopics returns only discovered topics mentioned by at least five distinct
+// responses in this period. Candidate labels remain stored for future matching but never
+// reach the dashboard before the privacy and noise threshold is met.
+func (s *Service) VisibleEmergingTopics(periodID string) ([]models.EmergingTopic, error) {
+	var topics []models.EmergingTopic
+	err := s.db.Model(&models.EmergingTopic{}).
+		Joins("JOIN response_emerging_topics ON response_emerging_topics.emerging_topic_id = emerging_topics.id").
+		Joins("JOIN survey_responses ON survey_responses.id = response_emerging_topics.response_id").
+		Where("emerging_topics.org_id = ? AND survey_responses.period_id = ?", s.orgID, periodID).
+		Group("emerging_topics.id").
+		Having("COUNT(DISTINCT survey_responses.id) >= ?", privacy.MinGroupSizeSQL).
+		Order("emerging_topics.created_at, emerging_topics.id").
+		Find(&topics).Error
+
+	return topics, err
 }
 
 // TopicAverages returns the company-wide average per topic for a period (no suppression —
@@ -682,7 +706,15 @@ func (s *Service) departmentTopicResponses(periodID, topicID, departmentID strin
 	}
 	query := s.db.Model(&models.SurveyResponse{}).
 		Joins("JOIN response_analysis ON response_analysis.response_id = survey_responses.id").
-		Where("survey_responses.org_id = ? AND survey_responses.period_id = ? AND response_analysis.categories::jsonb @> ?::jsonb", s.orgID, periodID, string(containsTopic))
+		Where("survey_responses.org_id = ? AND survey_responses.period_id = ?", s.orgID, periodID).
+		Where(`(
+			response_analysis.categories::jsonb @> ?::jsonb
+			OR EXISTS (
+				SELECT 1 FROM response_emerging_topics
+				WHERE response_emerging_topics.response_id = survey_responses.id
+				  AND response_emerging_topics.emerging_topic_id = ?
+			)
+		)`, string(containsTopic), topicID)
 	if departmentID == UnassignedDepartmentID {
 		query = query.Where("survey_responses.department_id IS NULL")
 	} else {
@@ -785,7 +817,7 @@ func (s *Service) TopicSampleQuotes(periodID, topicID, departmentID string) ([]s
 		return nil, err
 	}
 	departmentClause := ""
-	args := []any{s.orgID, periodID, string(containsTopic)}
+	args := []any{s.orgID, periodID, string(containsTopic), topicID}
 	if departmentID == UnassignedDepartmentID {
 		departmentClause = " AND survey_responses.department_id IS NULL"
 	} else if departmentID != "" {
@@ -800,7 +832,14 @@ func (s *Service) TopicSampleQuotes(periodID, topicID, departmentID string) ([]s
 			FROM survey_responses
 			JOIN response_analysis ON response_analysis.response_id = survey_responses.id
 			WHERE survey_responses.org_id = ? AND survey_responses.period_id = ?
-			  AND response_analysis.categories::jsonb @> ?::jsonb`+departmentClause+`
+			  AND (
+				response_analysis.categories::jsonb @> ?::jsonb
+				OR EXISTS (
+					SELECT 1 FROM response_emerging_topics
+					WHERE response_emerging_topics.response_id = survey_responses.id
+					  AND response_emerging_topics.emerging_topic_id = ?
+				)
+			  )`+departmentClause+`
 		), safe AS (
 			SELECT 1 FROM eligible HAVING COUNT(DISTINCT id) >= ?
 		)
@@ -848,7 +887,15 @@ func (s *Service) TopicStats(periodID, topicID string) (TopicStats, error) {
 	}
 	err = s.db.Model(&models.SurveyResponse{}).
 		Joins("JOIN response_analysis ON response_analysis.response_id = survey_responses.id").
-		Where("survey_responses.period_id = ? AND response_analysis.categories::jsonb @> ?::jsonb", periodID, string(containsTopic)).
+		Where("survey_responses.org_id = ? AND survey_responses.period_id = ?", s.orgID, periodID).
+		Where(`(
+			response_analysis.categories::jsonb @> ?::jsonb
+			OR EXISTS (
+				SELECT 1 FROM response_emerging_topics
+				WHERE response_emerging_topics.response_id = survey_responses.id
+				  AND response_emerging_topics.emerging_topic_id = ?
+			)
+		)`, string(containsTopic), topicID).
 		Select("AVG(survey_responses.satisfaction_score) AS score, COUNT(DISTINCT survey_responses.id) AS respondents").
 		Scan(&row).Error
 	if err != nil {
@@ -902,7 +949,15 @@ func (s *Service) TopicTrend(upTo *models.SurveyPeriod, topicID string, months i
 		var row struct{ Score float64 }
 		result := s.db.Model(&models.SurveyResponse{}).
 			Joins("JOIN response_analysis ON response_analysis.response_id = survey_responses.id").
-			Where("survey_responses.period_id = ? AND response_analysis.categories::jsonb @> ?::jsonb", p.ID, string(containsTopic)).
+			Where("survey_responses.org_id = ? AND survey_responses.period_id = ?", s.orgID, p.ID).
+			Where(`(
+				response_analysis.categories::jsonb @> ?::jsonb
+				OR EXISTS (
+					SELECT 1 FROM response_emerging_topics
+					WHERE response_emerging_topics.response_id = survey_responses.id
+					  AND response_emerging_topics.emerging_topic_id = ?
+				)
+			)`, string(containsTopic), topicID).
 			Group("survey_responses.period_id").
 			Having("COUNT(DISTINCT survey_responses.id) >= ?", privacy.MinGroupSizeSQL).
 			Select("ROUND(AVG(survey_responses.satisfaction_score)::numeric, 2)::float8 AS score").

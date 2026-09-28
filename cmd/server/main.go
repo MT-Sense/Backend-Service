@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"log"
 	"os"
@@ -51,7 +52,9 @@ func main() {
 		AllowCredentials: true,
 	}))
 
-	router.Register(app, db, cfg)
+	workerContext, stopWorker := context.WithCancel(context.Background())
+	analysisQueue := router.Register(app, db, cfg)
+	analysisQueue.Start(workerContext)
 
 	go func() {
 		if err := app.Listen(":" + cfg.Port); err != nil {
@@ -63,6 +66,7 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
+	stopWorker()
 
 	log.Println("server: shutting down…")
 	if err := app.ShutdownWithTimeout(10 * time.Second); err != nil {

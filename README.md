@@ -39,12 +39,14 @@ openssl rand -base64 48
 go run ./cmd/server
 ```
 
-ข้อความในแบบสำรวจถูกส่งไปวิเคราะห์ที่ AI-Service ก่อนบันทึกคำตอบ เริ่ม AI-Service
-ที่ `http://127.0.0.1:8000` ก่อน (ดู `../AI-Service/README.md`) หรือกำหนด
-`AI_SERVICE_URL` ใน `.env` ของ Backend หากใช้พอร์ตอื่น Backend ส่งเฉพาะข้อความที่
-ลบข้อมูลระบุตัวตนแล้ว และบันทึก sentiment, confidence, หมวดหัวข้อ และเหตุผลจาก AI-Service
-ลง `response_analysis` ถ้า AI-Service ไม่พร้อม การส่งคำตอบที่มีข้อความจะตอบ 503
-และไม่บันทึกคำตอบ; คำตอบที่ไม่มีข้อความยังส่งได้
+คำตอบถูกบันทึกทันทีโดยไม่ต้องรอ AI หลังลบข้อมูลระบุตัวตนจากข้อความแล้ว Backend จะรวม
+ข้อความที่รอวิเคราะห์แยกตามองค์กรและรอบสำรวจ ส่งไป AI-Service เมื่อครบ 12 ข้อความหรือ
+เมื่อข้อความเก่าสุดรอครบ 10 นาที แล้วบันทึก sentiment, confidence, หมวดหัวข้อ และเหตุผลลง
+`response_analysis` การปิดรอบจะบังคับวิเคราะห์ข้อความที่เหลือก่อนคำนวณ alerts และสรุป
+
+เริ่ม AI-Service ที่ `http://127.0.0.1:8000` ก่อน (ดู `../AI-Service/README.md`) หรือกำหนด
+`AI_SERVICE_URL` ใน `.env` ของ Backend หากใช้พอร์ตอื่น หาก AI-Service ไม่พร้อม คำตอบยัง
+ถูกเก็บในสถานะ `failed` และลองใหม่หลัง 10 นาที โดยไม่มี user id อยู่ในคิววิเคราะห์
 
 ครั้งแรกจะ migrate + seed ข้อมูลตัวอย่างให้อัตโนมัติ (1 องค์กร, แผนก/ตำแหน่ง, 6 รอบสำรวจ —
 5 รอบปิดแล้ว + 1 รอบเปิดอยู่ พร้อม response/analysis จริงทุกแถว)
@@ -160,7 +162,7 @@ Auth: `Authorization: Bearer <accessToken>` ทุก endpoint ยกเว้�
 | GET | `/api/dashboard/hr/kpi` · `/heatmap` · `/wordcloud` · `/insight` · `/alerts` |
 | GET | `/api/dashboard/hr/topics/:id` |
 | GET/POST | `/api/survey-periods` | list / เปิดรอบใหม่ |
-| POST | `/api/survey-periods/:id/close` | ปิดรอบ + คำนวณ alerts |
+| POST | `/api/survey-periods/:id/close` | ปิดรอบ + วิเคราะห์คิวที่เหลือ + คำนวณ alerts |
 | POST | `/api/survey-periods/:id/import/preview` | ตรวจไฟล์ Excel และ Department โดยยังไม่บันทึก |
 | POST | `/api/survey-periods/:id/import` | วิเคราะห์และนำเข้าคำตอบจาก Excel แบบครบทั้งไฟล์ |
 

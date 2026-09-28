@@ -8,6 +8,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/mt-sense/backend-service/internal/aiservice"
+	"github.com/mt-sense/backend-service/internal/analysisqueue"
 	"github.com/mt-sense/backend-service/internal/analytics"
 	"github.com/mt-sense/backend-service/internal/auth"
 	"github.com/mt-sense/backend-service/internal/config"
@@ -41,18 +42,19 @@ func onboardingLimiter(max int, expiration time.Duration) fiber.Handler {
 // before login (join-by-code), it comes from the join code itself. No handler holds a
 // boot-time org constant anymore — analytics.Service is shared read-only across requests and
 // cloned per-request via Service.WithOrg.
-func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) {
+func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) *analysisqueue.Service {
 	issuer := auth.NewIssuer(cfg.JWTSecret, cfg.AccessTTL, cfg.RefreshTTL)
 	stats := analytics.New(db)
 	ai := aiservice.New(cfg.AIServiceURL, 25*time.Second)
+	analysisQueue := analysisqueue.New(db, ai)
 	kb := knowledgebase.New(db, ai)
 
 	authH := handlers.NewAuthHandler(db, issuer)
 	dashH := handlers.NewDashboardHandler(db, stats, ai)
-	surveyH := handlers.NewSurveyHandler(db, stats, ai)
+	surveyH := handlers.NewSurveyHandler(db, stats, analysisQueue)
 	trainingH := handlers.NewModelTrainingHandler(db, ai, cfg.AITrainingToken)
 	feedH := handlers.NewFeedHandler(db, cfg.JWTSecret)
-	periodsH := handlers.NewPeriodsHandler(db, stats, ai, kb)
+	periodsH := handlers.NewPeriodsHandler(db, stats, ai, kb, analysisQueue)
 	knowledgeH := handlers.NewKnowledgeBaseHandler(kb)
 	onboardH := handlers.NewOnboardingHandler(db, issuer)
 	departmentsH := handlers.NewDepartmentsHandler(db)
@@ -159,4 +161,6 @@ func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) {
 	// Admin (HR) or Executive — both can open follow-ups; the handler marks Executive ones
 	// decision-level.
 	r.Post("/action-items", leadership, feedH.CreateActionItem)
+
+	return analysisQueue
 }

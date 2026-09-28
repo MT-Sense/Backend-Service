@@ -16,6 +16,7 @@ import (
 
 	"github.com/mt-sense/backend-service/internal/aiservice"
 	"github.com/mt-sense/backend-service/internal/dto"
+	"github.com/mt-sense/backend-service/internal/emergingtopics"
 	"github.com/mt-sense/backend-service/internal/middleware"
 	"github.com/mt-sense/backend-service/internal/models"
 	"github.com/mt-sense/backend-service/internal/privacy"
@@ -165,7 +166,7 @@ func (h *PeriodsHandler) ImportWorkbook(c *fiber.Ctx) error {
 		departmentID := row.DepartmentID
 		responses = append(responses, models.SurveyResponse{
 			ID: responseID, OrgID: orgID, PeriodID: period.ID, DepartmentID: &departmentID,
-			SatisfactionScore: row.Score, CommentText: row.Redacted, SubmittedAt: now,
+			SatisfactionScore: row.Score, CommentText: row.Redacted, AnalysisStatus: "analyzed", SubmittedAt: now,
 		})
 		analyses = append(analyses, models.ResponseAnalysis{
 			ID: uuid.NewString(), ResponseID: responseID,
@@ -184,7 +185,16 @@ func (h *PeriodsHandler) ImportWorkbook(c *fiber.Ctx) error {
 		if err := tx.CreateInBatches(&responses, 100).Error; err != nil {
 			return err
 		}
-		return tx.CreateInBatches(&analyses, 100).Error
+		if err := tx.CreateInBatches(&analyses, 100).Error; err != nil {
+			return err
+		}
+		for index, response := range responses {
+			if err := emergingtopics.Save(tx, orgID, response.ID, results[index].EmergingTopics); err != nil {
+				return err
+			}
+		}
+
+		return nil
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

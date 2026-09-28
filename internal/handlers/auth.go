@@ -183,11 +183,17 @@ func (h *AuthHandler) Me(c *fiber.Ctx) error {
 	return c.JSON(dto.NewUser(&user, departmentName(h.db, user.DepartmentID), positionName(h.db, user.PositionID)))
 }
 
-// UpdateMe changes the caller's own notification preferences and nothing else.
+// UpdateMe changes the caller's own display name and notification preferences.
+// Email, role, department and position are deliberately not accepted here.
 func (h *AuthHandler) UpdateMe(c *fiber.Ctx) error {
 	var req dto.UpdateSettingsRequest
 	if err := c.BodyParser(&req); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "malformed request body")
+	}
+
+	req.Normalize()
+	if problems := req.Validate(); len(problems) > 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(dto.ValidationErrors{Errors: problems})
 	}
 
 	updates := req.Updates()

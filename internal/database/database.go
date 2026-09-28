@@ -136,6 +136,9 @@ func Migrate(db *gorm.DB) error {
 	if err := db.AutoMigrate(models.AllModels()...); err != nil {
 		return fmt.Errorf("running migrations: %w", err)
 	}
+	if err := backfillAnalysisStatuses(db); err != nil {
+		return fmt.Errorf("backfilling analysis statuses: %w", err)
+	}
 	if err := backfillJoinCodes(db); err != nil {
 		return fmt.Errorf("backfilling join codes: %w", err)
 	}
@@ -147,6 +150,26 @@ func Migrate(db *gorm.DB) error {
 	}
 	log.Println("database: migrations applied")
 	return nil
+}
+
+func backfillAnalysisStatuses(db *gorm.DB) error {
+	if err := db.Exec(`
+		UPDATE survey_responses sr
+		SET analysis_status = 'analyzed'
+		WHERE EXISTS (
+			SELECT 1 FROM response_analysis ra WHERE ra.response_id = sr.id
+		)
+		AND analysis_status <> 'analyzed'
+	`).Error; err != nil {
+		return err
+	}
+
+	return db.Exec(`
+		UPDATE survey_responses
+		SET analysis_status = 'skipped'
+		WHERE BTRIM(COALESCE(comment_text, '')) = ''
+		AND analysis_status <> 'skipped'
+	`).Error
 }
 
 func backfillDepartmentCodes(db *gorm.DB) error {

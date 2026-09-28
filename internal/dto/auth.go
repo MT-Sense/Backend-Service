@@ -3,6 +3,7 @@ package dto
 import (
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mt-sense/backend-service/internal/models"
 )
@@ -34,15 +35,39 @@ type RefreshRequest struct {
 }
 
 type UpdateSettingsRequest struct {
-	NotifyNewRound       *bool `json:"notifyNewRound"`
-	NotifyMonthlySummary *bool `json:"notifyMonthlySummary"`
+	FullName             *string `json:"fullName"`
+	NotifyNewRound       *bool   `json:"notifyNewRound"`
+	NotifyMonthlySummary *bool   `json:"notifyMonthlySummary"`
 }
 
-// Updates returns the column set to write. Only the two notification toggles are
-// accepted — role, department and email are not user-editable, and listing the allowed
-// columns here means a future model field cannot become writable by accident.
+func (r *UpdateSettingsRequest) Normalize() {
+	if r.FullName != nil {
+		name := strings.TrimSpace(*r.FullName)
+		r.FullName = &name
+	}
+}
+
+func (r *UpdateSettingsRequest) Validate() []string {
+	var problems []string
+	if r.FullName != nil {
+		if *r.FullName == "" {
+			problems = append(problems, "fullName is required")
+		}
+		if utf8.RuneCountInString(*r.FullName) > 100 {
+			problems = append(problems, "fullName must be 100 characters or fewer")
+		}
+	}
+	return problems
+}
+
+// Updates returns the explicit column allow-list for the settings screen. Role,
+// department and email remain non-editable, and a future model field cannot become writable
+// by accident.
 func (r *UpdateSettingsRequest) Updates() map[string]any {
 	updates := map[string]any{}
+	if r.FullName != nil {
+		updates["full_name"] = *r.FullName
+	}
 	if r.NotifyNewRound != nil {
 		updates["notify_new_round"] = *r.NotifyNewRound
 	}

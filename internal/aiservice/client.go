@@ -14,12 +14,18 @@ import (
 
 // Result uses the same topic IDs as response_analysis and the dashboards.
 type Result struct {
-	SentimentLabel string   `json:"sentiment_label"`
-	SentimentScore float32  `json:"sentiment_score"`
-	Confidence     float32  `json:"confidence"`
-	LowConfidence  bool     `json:"low_confidence"`
-	Categories     []string `json:"categories"`
-	Reason         string   `json:"reason"`
+	SentimentLabel string          `json:"sentiment_label"`
+	SentimentScore float32         `json:"sentiment_score"`
+	Confidence     float32         `json:"confidence"`
+	LowConfidence  bool            `json:"low_confidence"`
+	Categories     []string        `json:"categories"`
+	EmergingTopics []EmergingTopic `json:"emerging_topics"`
+	Reason         string          `json:"reason"`
+}
+
+type EmergingTopic struct {
+	LabelTH string `json:"label_th"`
+	LabelEN string `json:"label_en"`
 }
 
 type KnowledgeTopic struct {
@@ -67,21 +73,21 @@ type KnowledgeCompileRequest struct {
 
 type KnowledgeCompileResult struct {
 	TitleTH            string   `json:"title_th"`
-	TitleEN             string   `json:"title_en"`
-	SummaryTH           string   `json:"summary_th"`
-	SummaryEN           string   `json:"summary_en"`
-	Markdown            string   `json:"markdown"`
-	Tags                []string `json:"tags"`
-	RelatedPeriodIDs    []string `json:"related_period_ids"`
+	TitleEN            string   `json:"title_en"`
+	SummaryTH          string   `json:"summary_th"`
+	SummaryEN          string   `json:"summary_en"`
+	Markdown           string   `json:"markdown"`
+	Tags               []string `json:"tags"`
+	RelatedPeriodIDs   []string `json:"related_period_ids"`
 	SuggestedQuestions []string `json:"suggested_questions"`
 }
 
 type KnowledgeQAArticle struct {
-	PeriodID      string          `json:"period_id"`
-	PeriodLabel   string          `json:"period_label"`
-	Title         string          `json:"title"`
-	Summary       string          `json:"summary"`
-	Tags          []string        `json:"tags"`
+	PeriodID       string          `json:"period_id"`
+	PeriodLabel    string          `json:"period_label"`
+	Title          string          `json:"title"`
+	Summary        string          `json:"summary"`
+	Tags           []string        `json:"tags"`
 	SourceSnapshot json.RawMessage `json:"source_snapshot"`
 }
 
@@ -161,7 +167,7 @@ func (c *Client) Analyze(ctx context.Context, text string) (*Result, error) {
 	return &results[0], nil
 }
 
-// AnalyzeMany is used by HR workbook imports; the AI service processes texts in batches.
+// AnalyzeMany is used by the anonymous response queue and HR workbook imports.
 func (c *Client) AnalyzeMany(ctx context.Context, texts []string) ([]Result, error) {
 	if len(texts) == 0 {
 		return []Result{}, nil
@@ -208,6 +214,12 @@ func (c *Client) analyze(ctx context.Context, texts []string, client *http.Clien
 		for _, category := range result.Categories {
 			if !validCategory(category) {
 				return nil, fmt.Errorf("AI service returned an unknown category %q", category)
+			}
+		}
+		for _, topic := range result.EmergingTopics {
+			label := strings.TrimSpace(topic.LabelTH)
+			if len([]rune(label)) < 2 || len([]rune(label)) > 40 {
+				return nil, errors.New("AI service returned an invalid emerging topic label")
 			}
 		}
 	}
@@ -303,7 +315,9 @@ func (c *Client) AskKnowledge(ctx context.Context, request KnowledgeQARequest) (
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		var payload struct { Detail string `json:"detail"` }
+		var payload struct {
+			Detail string `json:"detail"`
+		}
 		_ = json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&payload)
 		return nil, fmt.Errorf("AI knowledge Q&A returned status %d: %s", resp.StatusCode, payload.Detail)
 	}
