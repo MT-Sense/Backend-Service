@@ -14,6 +14,7 @@ import (
 	"github.com/mt-sense/backend-service/internal/analytics"
 	"github.com/mt-sense/backend-service/internal/dto"
 	"github.com/mt-sense/backend-service/internal/knowledgebase"
+	"github.com/mt-sense/backend-service/internal/mailer"
 	"github.com/mt-sense/backend-service/internal/middleware"
 	"github.com/mt-sense/backend-service/internal/models"
 )
@@ -26,10 +27,11 @@ type PeriodsHandler struct {
 	ai    *aiservice.Client
 	kb    *knowledgebase.Service
 	queue *analysisqueue.Service
+	mail  *mailer.Service
 }
 
-func NewPeriodsHandler(db *gorm.DB, stats *analytics.Service, ai *aiservice.Client, kb *knowledgebase.Service, queue *analysisqueue.Service) *PeriodsHandler {
-	return &PeriodsHandler{db: db, stats: stats, ai: ai, kb: kb, queue: queue}
+func NewPeriodsHandler(db *gorm.DB, stats *analytics.Service, ai *aiservice.Client, kb *knowledgebase.Service, queue *analysisqueue.Service, mail *mailer.Service) *PeriodsHandler {
+	return &PeriodsHandler{db: db, stats: stats, ai: ai, kb: kb, queue: queue, mail: mail}
 }
 
 // List returns every survey period for the org, newest first, with response counts.
@@ -55,7 +57,8 @@ func (h *PeriodsHandler) List(c *fiber.Ctx) error {
 }
 
 // Create opens a new monthly round. If opens/closes are not supplied, it opens now and
-// closes one calendar month later.
+// closes one calendar month later. Members who left notify_new_round on get a "survey is
+// open" email, queued in the same transaction and delivered at opens_at.
 func (h *PeriodsHandler) Create(c *fiber.Ctx) error {
 	var req dto.CreatePeriodRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -83,9 +86,15 @@ func (h *PeriodsHandler) Create(c *fiber.Ctx) error {
 		ClosesAt:              closes,
 		EnabledExtraQuestions: req.EnabledExtraQuestions,
 	}
-	if err := h.db.Create(&period).Error; err != nil {
+	if err := h.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&period).Error; err != nil {
+			return err
+		}
+		return h.mail.EnqueueNewRound(tx, &period)
+	}); err != nil {
 		return err
 	}
+	h.mail.Notify()
 	return c.Status(fiber.StatusCreated).JSON(dto.NewSurveyPeriod(&period, false, 0))
 }
 

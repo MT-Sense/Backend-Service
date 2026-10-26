@@ -410,6 +410,18 @@ type FeedPost struct {
 	HRReplied bool      `gorm:"default:false" json:"hrReplied"`
 	OptedIn   bool      `gorm:"default:false;index" json:"optedIn"`
 	Published bool      `gorm:"default:false;index" json:"published"`
+	// ModeratedAt is set whenever HR decides publish/reject, so a rejected post (published
+	// false) leaves the pending queue instead of waiting there forever.
+	ModeratedAt *time.Time `json:"-"`
+	// HRReply is HR's public answer, shown under the post to everyone in the org. Posts are
+	// not linked to their author, so a public reply is the only way an answer can reach them.
+	// HRReplied stays as the badge flag: true whenever a reply exists (seeded demo posts set
+	// it without text).
+	HRReply     string     `gorm:"type:text;not null;default:''" json:"-"`
+	HRRepliedAt *time.Time `json:"-"`
+	// ActionItemID links the post to what the company is doing about it, shown with HR's
+	// reply ("in progress: …" / "fixed"). Cleared when the action item is deleted.
+	ActionItemID *string `gorm:"size:64;index" json:"-"`
 }
 
 // FeedVote records that *a* vote happened for dedupe, keyed by a per-user-per-post hash
@@ -433,7 +445,21 @@ type ActionItem struct {
 	Level      string    `gorm:"size:32;default:full" json:"level"`
 	TargetDate string    `gorm:"size:32" json:"targetDate"`
 	CreatedAt  time.Time `json:"-"`
+	// CreatedByUserID lets an executive edit only the items they opened; nil for rows that
+	// predate the column (only HR can edit those). DoneAt is set when Status becomes done.
+	CreatedByUserID *string    `gorm:"size:64" json:"-"`
+	DoneAt          *time.Time `json:"-"`
 }
+
+const (
+	ActionItemInProgress = "in_progress"
+	ActionItemDone       = "done"
+)
+
+const (
+	SummaryDraft     = "draft"
+	SummaryPublished = "published"
+)
 
 type PublishedSummary struct {
 	ID          string    `gorm:"primaryKey;size:64" json:"id"`
@@ -441,6 +467,13 @@ type PublishedSummary struct {
 	Title       Localized `gorm:"serializer:json" json:"title"`
 	Body        Localized `gorm:"serializer:json" json:"body"`
 	PublishedAt string    `gorm:"size:32" json:"publishedAt"`
+	// Status is draft or published; only published rows reach the employee feed. The
+	// default backfills rows that predate the column (all seeded summaries were public).
+	Status    string     `gorm:"size:16;not null;default:published;index" json:"-"`
+	PeriodID  *string    `gorm:"size:64;index" json:"-"`
+	CreatedBy *string    `gorm:"size:64" json:"-"`
+	CreatedAt *time.Time `json:"-"`
+	UpdatedAt *time.Time `json:"-"`
 }
 
 // AIInsight stores the period summary derived from AI-analyzed responses. The dashboard
@@ -532,5 +565,7 @@ func AllModels() []any {
 		&RefreshToken{},
 		&AutomationSettings{}, &AutomationProposal{}, &AutomationEvent{},
 		&RoutingPolicy{}, &RoutingCase{},
+		&EmailOutbox{},
+		&PasswordResetToken{},
 	}
 }

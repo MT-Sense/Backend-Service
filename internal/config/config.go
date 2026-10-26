@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -22,6 +23,22 @@ type Config struct {
 	AITrainingToken         string
 	AutomationEncryptionKey string
 	AutomationServiceToken  string
+	AppBaseURL              string
+	SMTP                    SMTPConfig
+}
+
+// SMTPConfig is optional: with an empty Host the mailer logs messages instead of sending
+// them, so local development works without a mail server.
+type SMTPConfig struct {
+	Host     string
+	Port     int
+	Username string
+	Password string
+	From     string
+	FromName string
+	// Security is "starttls" (port 587), "tls" (implicit TLS, port 465) or "none" (local
+	// relays such as Mailpit only).
+	Security string
 }
 
 // Load reads .env when present (absent is fine — real deployments use real env vars)
@@ -49,6 +66,16 @@ func Load() *Config {
 		AITrainingToken:         os.Getenv("AI_TRAINING_TOKEN"),
 		AutomationEncryptionKey: os.Getenv("AUTOMATION_ENCRYPTION_KEY"),
 		AutomationServiceToken:  os.Getenv("AUTOMATION_SERVICE_TOKEN"),
+		AppBaseURL:              strings.TrimRight(env("APP_BASE_URL", "http://localhost:5173"), "/"),
+		SMTP: SMTPConfig{
+			Host:     os.Getenv("SMTP_HOST"),
+			Port:     integer("SMTP_PORT", 587),
+			Username: os.Getenv("SMTP_USERNAME"),
+			Password: os.Getenv("SMTP_PASSWORD"),
+			From:     os.Getenv("SMTP_FROM"),
+			FromName: env("SMTP_FROM_NAME", "MT-Sense"),
+			Security: strings.ToLower(env("SMTP_SECURITY", "starttls")),
+		},
 	}
 }
 
@@ -85,4 +112,17 @@ func duration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return time.Duration(mins) * time.Minute
+}
+
+func integer(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Printf("config: %s=%q is not a number, using default", key, v)
+		return fallback
+	}
+	return n
 }

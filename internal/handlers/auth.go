@@ -10,17 +10,19 @@ import (
 
 	"github.com/mt-sense/backend-service/internal/auth"
 	"github.com/mt-sense/backend-service/internal/dto"
+	"github.com/mt-sense/backend-service/internal/mailer"
 	"github.com/mt-sense/backend-service/internal/middleware"
 	"github.com/mt-sense/backend-service/internal/models"
 )
 
 type AuthHandler struct {
+	mail   *mailer.Service
 	db     *gorm.DB
 	issuer *auth.Issuer
 }
 
-func NewAuthHandler(db *gorm.DB, issuer *auth.Issuer) *AuthHandler {
-	return &AuthHandler{db: db, issuer: issuer}
+func NewAuthHandler(db *gorm.DB, issuer *auth.Issuer, mail *mailer.Service) *AuthHandler {
+	return &AuthHandler{db: db, issuer: issuer, mail: mail}
 }
 
 // Login verifies credentials and mints the token pair. The role comes from the database
@@ -90,6 +92,11 @@ func (h *AuthHandler) Refresh(c *fiber.Ctx) error {
 	var user models.User
 	if err := h.db.First(&user, "id = ?", stored.UserID).Error; err != nil {
 		return fiber.NewError(fiber.StatusUnauthorized, "account no longer exists")
+	}
+	// HR deactivation revokes refresh tokens too; this also covers a token minted in the
+	// moment between the two.
+	if !user.IsActive {
+		return fiber.NewError(fiber.StatusUnauthorized, "account is deactivated")
 	}
 
 	now := time.Now()

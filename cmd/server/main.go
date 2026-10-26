@@ -53,8 +53,8 @@ func main() {
 	}))
 
 	workerContext, stopWorker := context.WithCancel(context.Background())
-	analysisQueue := router.Register(app, db, cfg)
-	analysisQueue.Start(workerContext)
+	workers := router.Register(app, db, cfg)
+	workers.Start(workerContext)
 
 	go func() {
 		if err := app.Listen(":" + cfg.Port); err != nil {

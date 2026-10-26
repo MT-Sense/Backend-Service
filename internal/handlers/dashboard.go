@@ -511,6 +511,28 @@ func (h *DashboardHandler) Alerts(c *fiber.Ctx) error {
 	return c.JSON(dto.NewAlerts(alerts))
 }
 
+// topicUnavailable answers 404 with a machine-readable reason, so the UI can tell HR whether
+// the topic is hidden by the n<5 rule ("suppressed") or comments are still waiting for AI
+// analysis ("analysis_pending"). Neither reason reveals anything about individual answers.
+func (h *DashboardHandler) topicUnavailable(c *fiber.Ctx, orgID, periodID, message string) error {
+	var pending int64
+	if err := h.db.Model(&models.SurveyResponse{}).
+		Where("org_id = ? AND period_id = ? AND analysis_status IN ?", orgID, periodID, []string{"pending", "processing", "failed"}).
+		Count(&pending).Error; err != nil {
+		return err
+	}
+	reason := "suppressed"
+	if pending > 0 {
+		reason = "analysis_pending"
+	}
+	return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+		"error":           message,
+		"reason":          reason,
+		"pendingAnalysis": pending,
+		"periodId":        periodID,
+	})
+}
+
 // TopicDrilldown is HR-only: it is the one endpoint that returns sample text, and even
 // there the text was redacted before it was stored.
 func (h *DashboardHandler) TopicDrilldown(c *fiber.Ctx) error {
@@ -550,7 +572,7 @@ func (h *DashboardHandler) TopicDrilldown(c *fiber.Ctx) error {
 			return err
 		}
 		if detail == nil {
-			return fiber.NewError(fiber.StatusNotFound, "department topic data is hidden or unavailable")
+			return h.topicUnavailable(c, orgID, period.ID, "department topic data is hidden or unavailable")
 		}
 		return c.JSON(dto.TopicDrilldown{
 			TopicID: topicID, Label: topicLabel,
@@ -567,7 +589,7 @@ func (h *DashboardHandler) TopicDrilldown(c *fiber.Ctx) error {
 		return err
 	}
 	if stats.RespondentCount < models.MinGroupSize {
-		return fiber.NewError(fiber.StatusNotFound, "topic data is hidden or unavailable")
+		return h.topicUnavailable(c, orgID, period.ID, "topic data is hidden or unavailable")
 	}
 	trend, err := statsSvc.TopicTrend(period, topicID, 6)
 	if err != nil {

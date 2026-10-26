@@ -61,17 +61,62 @@ func (h *FeedHandler) List(c *fiber.Ctx) error {
 		return err
 	}
 
+	out := dto.NewFeedPosts(posts)
+	mine, err := h.myVotes(middleware.UserID(c), posts)
+	if err != nil {
+		return err
+	}
+	for i := range out {
+		out[i].MyVote = mine[out[i].ID]
+	}
+	if err := h.attachActionItems(middleware.OrgID(c), posts, out); err != nil {
+		return err
+	}
+
 	return c.JSON(dto.FeedList{
-		Posts:  dto.NewFeedPosts(posts),
+		Posts:  out,
 		Total:  total,
 		Limit:  limit,
 		Offset: offset,
 	})
 }
 
-// Vote records one vote per person per post. The voter is stored as a keyed hash of
-// (secret, user, post): enough to reject a second vote on that post, useless for
-// reconstructing which opinions a given person endorsed.
+// myVotes returns the caller's vote per post. Only the caller can derive their own voter
+// hashes, so this reveals nothing about anyone else's votes.
+func (h *FeedHandler) myVotes(userID string, posts []models.FeedPost) (map[string]int, error) {
+	out := make(map[string]int, len(posts))
+	if userID == "" || len(posts) == 0 {
+		return out, nil
+	}
+	hashes := make([]string, 0, len(posts))
+	ids := make([]string, 0, len(posts))
+	for _, p := range posts {
+		ids = append(ids, p.ID)
+		hashes = append(hashes, auth.VoterHash(h.voteSecret, userID, p.ID))
+	}
+	var votes []models.FeedVote
+	if err := h.db.Where("post_id IN ? AND voter_hash IN ?", ids, hashes).Find(&votes).Error; err != nil {
+		return nil, err
+	}
+	for _, v := range votes {
+		if v.VoterHash == auth.VoterHash(h.voteSecret, userID, v.PostID) {
+			out[v.PostID] = v.Direction
+		}
+	}
+	return out, nil
+}
+
+func voteColumn(direction int) string {
+	if direction == -1 {
+		return "downvotes"
+	}
+	return "upvotes"
+}
+
+// Vote sets the caller's vote on a post, Reddit-style: voting the same direction again
+// removes the vote, voting the other direction switches it. One vote per person per post is
+// kept by the (post, voter hash) unique index; the voter is a keyed hash of (secret, user,
+// post), enough to find your own vote, useless for reconstructing anyone's opinions.
 func (h *FeedHandler) Vote(c *fiber.Ctx) error {
 	postID := c.Params("id")
 
@@ -94,25 +139,50 @@ func (h *FeedHandler) Vote(c *fiber.Ctx) error {
 
 	voter := auth.VoterHash(h.voteSecret, middleware.UserID(c), postID)
 
+	myVote := 0
 	err = h.db.Transaction(func(tx *gorm.DB) error {
-		vote := models.FeedVote{PostID: postID, VoterHash: voter, Direction: req.Direction, CreatedAt: time.Now()}
-		result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&vote)
-		if result.Error != nil {
-			return result.Error
+		// Lock the post so concurrent votes on it apply one at a time and the counters
+		// always match the vote rows.
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id").
+			First(&models.FeedPost{}, "id = ?", postID).Error; err != nil {
+			return err
 		}
-		if result.RowsAffected == 0 {
-			return errAlreadyVoted
+		adjust := func(direction int, delta string) error {
+			column := voteColumn(direction)
+			return tx.Model(&models.FeedPost{}).Where("id = ?", postID).
+				UpdateColumn(column, gorm.Expr("GREATEST("+column+" "+delta+" 1, 0)")).Error
 		}
-		column := "upvotes"
-		if req.Direction == -1 {
-			column = "downvotes"
+
+		var existing models.FeedVote
+		err := tx.Where("post_id = ? AND voter_hash = ?", postID, voter).First(&existing).Error
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			vote := models.FeedVote{PostID: postID, VoterHash: voter, Direction: req.Direction, CreatedAt: time.Now()}
+			if err := tx.Create(&vote).Error; err != nil {
+				return err
+			}
+			myVote = req.Direction
+			return adjust(req.Direction, "+")
+		case err != nil:
+			return err
+		case existing.Direction == req.Direction:
+			if err := tx.Delete(&existing).Error; err != nil {
+				return err
+			}
+			return adjust(req.Direction, "-")
+		default:
+			// Capture before updating: Update also rewrites existing.Direction in memory.
+			previous := existing.Direction
+			if err := tx.Model(&existing).Update("direction", req.Direction).Error; err != nil {
+				return err
+			}
+			myVote = req.Direction
+			if err := adjust(previous, "-"); err != nil {
+				return err
+			}
+			return adjust(req.Direction, "+")
 		}
-		return tx.Model(&models.FeedPost{}).Where("id = ?", postID).
-			UpdateColumn(column, gorm.Expr(column+" + 1")).Error
 	})
-	if errors.Is(err, errAlreadyVoted) {
-		return fiber.NewError(fiber.StatusConflict, "you have already voted on this post")
-	}
 	if err != nil {
 		return err
 	}
@@ -120,28 +190,62 @@ func (h *FeedHandler) Vote(c *fiber.Ctx) error {
 	if err := h.db.First(&post, "id = ?", postID).Error; err != nil {
 		return err
 	}
-	return c.JSON(dto.NewFeedPost(&post))
+	out := []dto.FeedPost{dto.NewFeedPost(&post)}
+	out[0].MyVote = myVote
+	if err := h.attachActionItems(middleware.OrgID(c), []models.FeedPost{post}, out); err != nil {
+		return err
+	}
+	return c.JSON(out[0])
 }
 
-var errAlreadyVoted = errors.New("already voted")
+// attachActionItems fills out[i].ActionItem for posts linked to an action item of the org.
+func (h *FeedHandler) attachActionItems(orgID string, posts []models.FeedPost, out []dto.FeedPost) error {
+	ids := make([]string, 0, len(posts))
+	for _, p := range posts {
+		if p.ActionItemID != nil {
+			ids = append(ids, *p.ActionItemID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	var items []models.ActionItem
+	if err := h.db.Where("org_id = ? AND id IN ?", orgID, ids).Find(&items).Error; err != nil {
+		return err
+	}
+	byID := make(map[string]*models.ActionItem, len(items))
+	for i := range items {
+		byID[items[i].ID] = &items[i]
+	}
+	for i, p := range posts {
+		if p.ActionItemID != nil {
+			if item, ok := byID[*p.ActionItemID]; ok {
+				out[i].ActionItem = dto.NewLinkedActionItem(item)
+			}
+		}
+	}
+	return nil
+}
 
-// Summaries serves what HR has explicitly published — never live aggregates, so employees
-// only ever see reviewed content.
+// Summaries serves what HR has explicitly published — never live aggregates or drafts, so
+// employees only ever see reviewed content.
 func (h *FeedHandler) Summaries(c *fiber.Ctx) error {
 	var summaries []models.PublishedSummary
-	if err := h.db.Where("org_id = ?", middleware.OrgID(c)).Order("published_at DESC").Find(&summaries).Error; err != nil {
+	if err := h.db.Where("org_id = ? AND status = ?", middleware.OrgID(c), models.SummaryPublished).
+		Order("published_at DESC, created_at DESC").Find(&summaries).Error; err != nil {
 		return err
 	}
 	return c.JSON(dto.NewPublishedSummaries(summaries))
 }
 
-// ActionItems lists what the company has committed to, for the feed sidebar.
+// ActionItems lists what the company has committed to, for the feed sidebar and the HR /
+// executive management screens.
 func (h *FeedHandler) ActionItems(c *fiber.Ctx) error {
 	var items []models.ActionItem
 	if err := h.db.Where("org_id = ?", middleware.OrgID(c)).Order("created_at DESC").Find(&items).Error; err != nil {
 		return err
 	}
-	return c.JSON(dto.NewActionItems(items))
+	return c.JSON(dto.NewActionItems(items, middleware.UserID(c)))
 }
 
 // CreateActionItem lets HR or Executive open a follow-up. Executive-authored items are
@@ -156,27 +260,106 @@ func (h *FeedHandler) CreateActionItem(c *fiber.Ctx) error {
 	}
 
 	role := middleware.CurrentRole(c)
+	if req.Assignee == "" {
+		req.Assignee = "TBD"
+	}
 	level := "full"
 	if role == models.RoleExecutive {
 		level = "decision"
 	}
 
+	userID := middleware.UserID(c)
 	item := models.ActionItem{
-		ID:         uuid.NewString(),
-		OrgID:      middleware.OrgID(c),
-		Topic:      req.Topic,
-		TopicID:    req.TopicID,
-		Assignee:   req.Assignee,
-		Status:     "in_progress",
-		CreatedBy:  role,
-		Level:      level,
-		TargetDate: req.TargetDate,
-		CreatedAt:  time.Now(),
+		ID:              uuid.NewString(),
+		OrgID:           middleware.OrgID(c),
+		Topic:           req.Topic,
+		TopicID:         req.TopicID,
+		Assignee:        req.Assignee,
+		Status:          models.ActionItemInProgress,
+		CreatedBy:       role,
+		Level:           level,
+		TargetDate:      req.TargetDate,
+		CreatedAt:       time.Now(),
+		CreatedByUserID: &userID,
 	}
 	if err := h.db.Create(&item).Error; err != nil {
 		return err
 	}
-	return c.Status(fiber.StatusCreated).JSON(dto.NewActionItem(&item))
+	return c.Status(fiber.StatusCreated).JSON(dto.NewActionItemFor(&item, userID))
+}
+
+// editableActionItem loads an item the caller may change: HR can edit any item in the org,
+// an executive only the ones they opened.
+func (h *FeedHandler) editableActionItem(c *fiber.Ctx) (*models.ActionItem, error) {
+	var item models.ActionItem
+	if err := h.db.Where("id = ? AND org_id = ?", c.Params("id"), middleware.OrgID(c)).First(&item).Error; err != nil {
+		return nil, fiber.NewError(fiber.StatusNotFound, "action item not found")
+	}
+	if middleware.CurrentRole(c) != models.RoleAdmin &&
+		(item.CreatedByUserID == nil || *item.CreatedByUserID != middleware.UserID(c)) {
+		return nil, fiber.NewError(fiber.StatusForbidden, "you can only change action items you created")
+	}
+	return &item, nil
+}
+
+func (h *FeedHandler) UpdateActionItem(c *fiber.Ctx) error {
+	var req dto.UpdateActionItemRequest
+	if err := c.BodyParser(&req); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "malformed request body")
+	}
+	if req.IsEmpty() {
+		return fiber.NewError(fiber.StatusBadRequest, "nothing to update")
+	}
+	if problems := req.Validate(); len(problems) > 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(dto.ValidationErrors{Errors: problems})
+	}
+	item, err := h.editableActionItem(c)
+	if err != nil {
+		return err
+	}
+
+	updates := map[string]any{}
+	if req.Status != nil && *req.Status != item.Status {
+		updates["status"] = *req.Status
+		if *req.Status == models.ActionItemDone {
+			updates["done_at"] = time.Now()
+		} else {
+			updates["done_at"] = nil
+		}
+	}
+	if req.Assignee != nil {
+		updates["assignee"] = *req.Assignee
+	}
+	if req.TargetDate != nil {
+		updates["target_date"] = *req.TargetDate
+	}
+	if len(updates) > 0 {
+		if err := h.db.Model(item).Updates(updates).Error; err != nil {
+			return err
+		}
+	}
+	if err := h.db.First(item, "id = ?", item.ID).Error; err != nil {
+		return err
+	}
+	return c.JSON(dto.NewActionItemFor(item, middleware.UserID(c)))
+}
+
+func (h *FeedHandler) DeleteActionItem(c *fiber.Ctx) error {
+	item, err := h.editableActionItem(c)
+	if err != nil {
+		return err
+	}
+	if err := h.db.Transaction(func(tx *gorm.DB) error {
+		// Posts that pointed at this item simply lose the link.
+		if err := tx.Model(&models.FeedPost{}).Where("action_item_id = ?", item.ID).
+			Update("action_item_id", nil).Error; err != nil {
+			return err
+		}
+		return tx.Delete(item).Error
+	}); err != nil {
+		return err
+	}
+	return c.SendStatus(fiber.StatusNoContent)
 }
 
 // Moderate is gate two of the publish flow: HR reviewing a post that its author already
@@ -188,6 +371,9 @@ func (h *FeedHandler) Moderate(c *fiber.Ctx) error {
 	}
 	if req.IsEmpty() {
 		return fiber.NewError(fiber.StatusBadRequest, "nothing to update")
+	}
+	if problems := req.Validate(); len(problems) > 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(dto.ValidationErrors{Errors: problems})
 	}
 
 	var post models.FeedPost
@@ -201,24 +387,61 @@ func (h *FeedHandler) Moderate(c *fiber.Ctx) error {
 			return fiber.NewError(fiber.StatusForbidden, "cannot publish a post the author did not opt in to share")
 		}
 		updates["published"] = *req.Published
+		updates["moderated_at"] = time.Now()
 	}
-	if req.HRReplied != nil {
+	switch {
+	case req.HRReply != nil && *req.HRReply != "":
+		updates["hr_reply"] = *req.HRReply
+		updates["hr_replied"] = true
+		updates["hr_replied_at"] = time.Now()
+	case req.HRReply != nil:
+		updates["hr_reply"] = ""
+		updates["hr_replied"] = false
+		updates["hr_replied_at"] = nil
+	case req.HRReplied != nil:
 		updates["hr_replied"] = *req.HRReplied
+	}
+	if req.ActionItemID != nil {
+		if *req.ActionItemID == "" {
+			updates["action_item_id"] = nil
+		} else {
+			var n int64
+			if err := h.db.Model(&models.ActionItem{}).
+				Where("org_id = ? AND id = ?", post.OrgID, *req.ActionItemID).Count(&n).Error; err != nil {
+				return err
+			}
+			if n == 0 {
+				return fiber.NewError(fiber.StatusBadRequest, "action item not found")
+			}
+			updates["action_item_id"] = *req.ActionItemID
+		}
 	}
 
 	if err := h.db.Model(&post).Updates(updates).Error; err != nil {
 		return err
 	}
-	return c.JSON(dto.NewFeedPost(&post))
+	if err := h.db.First(&post, "id = ?", post.ID).Error; err != nil {
+		return err
+	}
+	out := []dto.FeedPost{dto.NewFeedPost(&post)}
+	if err := h.attachActionItems(post.OrgID, []models.FeedPost{post}, out); err != nil {
+		return err
+	}
+	return c.JSON(out[0])
 }
 
-// PendingModeration lists opted-in posts still awaiting HR review (HR only).
+// PendingModeration lists opted-in posts HR has not decided on yet (HR only). Rejected posts
+// have moderated_at set and drop out of this list.
 func (h *FeedHandler) PendingModeration(c *fiber.Ctx) error {
 	var posts []models.FeedPost
-	err := h.db.Where("org_id = ? AND opted_in = ? AND published = ?", middleware.OrgID(c), true, false).
+	err := h.db.Where("org_id = ? AND opted_in = ? AND published = ? AND moderated_at IS NULL", middleware.OrgID(c), true, false).
 		Order("posted_on DESC").Find(&posts).Error
 	if err != nil {
 		return err
 	}
-	return c.JSON(dto.NewFeedPosts(posts))
+	out := dto.NewFeedPosts(posts)
+	if err := h.attachActionItems(middleware.OrgID(c), posts, out); err != nil {
+		return err
+	}
+	return c.JSON(out)
 }

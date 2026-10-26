@@ -179,7 +179,7 @@ func TestEmptyCollectionsSerializeAsArrays(t *testing.T) {
 		"departments":  NewDepartments(nil, nil),
 		"positions":    NewPositions(nil),
 		"feedPosts":    NewFeedPosts(nil),
-		"actionItems":  NewActionItems(nil),
+		"actionItems":  NewActionItems(nil, ""),
 		"summaries":    NewPublishedSummaries(nil),
 		"wordcloud":    NewWordCloud(nil),
 		"subIssues":    NewSubIssues(nil),

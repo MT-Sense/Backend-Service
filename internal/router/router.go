@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -14,6 +15,7 @@ import (
 	"github.com/mt-sense/backend-service/internal/config"
 	"github.com/mt-sense/backend-service/internal/handlers"
 	"github.com/mt-sense/backend-service/internal/knowledgebase"
+	"github.com/mt-sense/backend-service/internal/mailer"
 	"github.com/mt-sense/backend-service/internal/middleware"
 	"github.com/mt-sense/backend-service/internal/models"
 )
@@ -42,19 +44,23 @@ func onboardingLimiter(max int, expiration time.Duration) fiber.Handler {
 // before login (join-by-code), it comes from the join code itself. No handler holds a
 // boot-time org constant anymore — analytics.Service is shared read-only across requests and
 // cloned per-request via Service.WithOrg.
-func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) *analysisqueue.Service {
+func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) *Workers {
 	issuer := auth.NewIssuer(cfg.JWTSecret, cfg.AccessTTL, cfg.RefreshTTL)
 	stats := analytics.New(db)
 	ai := aiservice.New(cfg.AIServiceURL, 25*time.Second)
 	analysisQueue := analysisqueue.New(db, ai)
 	kb := knowledgebase.New(db, ai)
+	mail := mailer.New(db, mailer.NewSender(cfg.SMTP), cfg.AppBaseURL)
 
-	authH := handlers.NewAuthHandler(db, issuer)
+	authH := handlers.NewAuthHandler(db, issuer, mail)
+	usersH := handlers.NewUsersHandler(db, mail)
 	dashH := handlers.NewDashboardHandler(db, stats, ai)
 	surveyH := handlers.NewSurveyHandler(db, stats, analysisQueue)
 	trainingH := handlers.NewModelTrainingHandler(db, ai, cfg.AITrainingToken)
 	feedH := handlers.NewFeedHandler(db, cfg.JWTSecret)
-	periodsH := handlers.NewPeriodsHandler(db, stats, ai, kb, analysisQueue)
+	summariesH := handlers.NewSummariesHandler(db)
+	periodsH := handlers.NewPeriodsHandler(db, stats, ai, kb, analysisQueue, mail)
+	emailH := handlers.NewEmailHandler(db, stats, mail)
 	knowledgeH := handlers.NewKnowledgeBaseHandler(kb)
 	onboardH := handlers.NewOnboardingHandler(db, issuer)
 	departmentsH := handlers.NewDepartmentsHandler(db)
@@ -73,6 +79,10 @@ func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) *analysisqueue.Se
 	// --- public ---
 	api.Post("/auth/login", authH.Login)
 	api.Post("/auth/refresh", authH.Refresh)
+	// Password reset by email. Both are guessing/abuse surfaces, so rate limited per IP;
+	// forgot-password always answers 204 so it cannot reveal which emails have accounts.
+	api.Post("/auth/forgot-password", onboardingLimiter(5, 10*time.Minute), authH.ForgotPassword)
+	api.Post("/auth/reset-password", onboardingLimiter(10, 10*time.Minute), authH.ResetPassword)
 
 	// Self-service onboarding — see internal/handlers/onboarding.go. Rate limited (§4 of the
 	// onboarding plan): these are the guessing surface for the 6-char join code and the
@@ -89,6 +99,7 @@ func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) *analysisqueue.Se
 	r.Post("/auth/logout", authH.Logout)
 	r.Get("/settings/me", authH.Me)
 	r.Patch("/settings/me", authH.UpdateMe)
+	r.Post("/settings/me/password", onboardingLimiter(10, 10*time.Minute), authH.ChangePassword)
 	r.Get("/settings/me/submissions", authH.SubmissionHistory)
 	r.Get("/topics", dashH.Topics)
 	r.Get("/departments", dashH.Departments)
@@ -115,6 +126,12 @@ func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) *analysisqueue.Se
 	r.Get("/dashboard/hr/alerts", adminOnly, dashH.Alerts)
 	r.Get("/dashboard/hr/extra-questions", adminOnly, dashH.ExtraQuestions)
 	r.Get("/dashboard/hr/topics/:id", adminOnly, dashH.TopicDrilldown)
+	// Account management: profile, department, role and access only — no survey data.
+	r.Get("/hr/users", adminOnly, usersH.List)
+	r.Post("/hr/users", adminOnly, usersH.Create)
+	r.Patch("/hr/users/:id", adminOnly, usersH.Update)
+	r.Post("/hr/users/:id/password", adminOnly, usersH.SetPassword)
+	r.Post("/hr/users/:id/password-reset-email", adminOnly, onboardingLimiter(10, time.Minute), usersH.SendResetEmail)
 	r.Get("/hr/departments", adminOnly, departmentsH.List)
 	r.Post("/hr/departments", adminOnly, departmentsH.Create)
 	r.Patch("/hr/departments/:id", adminOnly, departmentsH.Update)
@@ -127,6 +144,10 @@ func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) *analysisqueue.Se
 	r.Post("/survey-periods/:id/import", adminOnly, periodsH.ImportWorkbook)
 	r.Get("/feed/pending", adminOnly, feedH.PendingModeration)
 	r.Patch("/feed/:id/moderate", adminOnly, feedH.Moderate)
+	r.Get("/hr/summaries", adminOnly, summariesH.List)
+	r.Post("/hr/summaries", adminOnly, summariesH.Create)
+	r.Patch("/hr/summaries/:id", adminOnly, summariesH.Update)
+	r.Delete("/hr/summaries/:id", adminOnly, summariesH.Delete)
 	r.Get("/org/join-code", adminOnly, onboardH.GetJoinCode)
 	r.Post("/org/join-code/regenerate", adminOnly, onboardH.RegenerateJoinCode)
 	r.Get("/org/settings", adminOnly, onboardH.GetOrgSettings)
@@ -158,9 +179,30 @@ func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) *analysisqueue.Se
 	// Executive only — aggregates, no raw text by construction.
 	r.Get("/dashboard/executive/summary", execOnly, dashH.ExecutiveSummary)
 
+	// Email: SMTP status and test are admin-only; HR and executives can email the
+	// aggregate summary, but only to other leaders of their own org (ids, not addresses).
+	r.Get("/email/status", adminOnly, emailH.Status)
+	r.Post("/email/test", adminOnly, onboardingLimiter(3, time.Minute), emailH.SendTest)
+	r.Get("/email/recipients", leadership, emailH.Recipients)
+	r.Post("/email/summary", leadership, onboardingLimiter(5, time.Minute), emailH.SendSummary)
+
 	// Admin (HR) or Executive — both can open follow-ups; the handler marks Executive ones
 	// decision-level.
 	r.Post("/action-items", leadership, feedH.CreateActionItem)
+	// HR may change any item; an executive only the ones they opened (checked in the handler).
+	r.Patch("/action-items/:id", leadership, feedH.UpdateActionItem)
+	r.Delete("/action-items/:id", leadership, feedH.DeleteActionItem)
 
-	return analysisQueue
+	return &Workers{analysis: analysisQueue, mail: mail}
+}
+
+// Workers are the background loops that must run alongside the HTTP server.
+type Workers struct {
+	analysis *analysisqueue.Service
+	mail     *mailer.Service
+}
+
+func (w *Workers) Start(ctx context.Context) {
+	w.analysis.Start(ctx)
+	w.mail.Start(ctx)
 }
