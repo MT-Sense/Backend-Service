@@ -119,11 +119,12 @@ func (h *EmailHandler) summaryMetrics(orgID string, stats *analytics.Service, pe
 	if m.Respondents, err = stats.TotalRespondents(period.ID); err != nil {
 		return m, err
 	}
-	if err := h.db.Model(&models.User{}).Where("org_id = ? AND is_active = ?", orgID, true).Count(&m.Headcount).Error; err != nil {
+	_, total, rate, err := stats.ResponseRate(period.ID, "")
+	if err != nil {
 		return m, err
 	}
-	if m.Headcount > 0 {
-		m.ResponseRate = int(float64(m.Respondents) / float64(m.Headcount) * 100)
+	if total != nil && rate != nil {
+		m.Headcount, m.ResponseRate, m.ResponseRateAvailable = *total, *rate, true
 	}
 	if m.Respondents < models.MinGroupSize {
 		m.Suppressed = true
@@ -138,11 +139,18 @@ func (h *EmailHandler) summaryMetrics(orgID string, stats *analytics.Service, pe
 		return m, err
 	}
 	m.ENPS = enps.Value
-	sentiment, err := stats.SentimentSplit(period.ID)
+	analyzed, err := stats.AnalyzedRespondents(period.ID)
 	if err != nil {
 		return m, err
 	}
-	m.Positive, m.Neutral, m.Negative = sentiment.Positive, sentiment.Neutral, sentiment.Negative
+	if analyzed >= models.MinGroupSize {
+		sentiment, err := stats.SentimentSplit(period.ID)
+		if err != nil {
+			return m, err
+		}
+		m.Positive, m.Neutral, m.Negative = sentiment.Positive, sentiment.Neutral, sentiment.Negative
+		m.SentimentAvailable = true
+	}
 	if m.BurnoutRisk, m.DepartmentsAtRisk, err = stats.BurnoutRisk(period.ID); err != nil {
 		return m, err
 	}

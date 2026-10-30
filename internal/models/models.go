@@ -161,6 +161,9 @@ type Topic struct {
 func (Topic) TableName() string { return "topics" }
 
 type SurveyPeriod struct {
+	// ResponseAudience is an immutable aggregate snapshot captured at creation; nil means unknown.
+	ResponseAudience map[string]int64 `gorm:"column:response_audience;serializer:json" json:"-"`
+
 	ID       string    `gorm:"column:id;primaryKey;size:64" json:"id"`
 	OrgID    string    `gorm:"column:org_id;size:64;not null;index;uniqueIndex:uq_survey_periods_org_month_year,priority:1" json:"-"`
 	Month    int16     `gorm:"column:month;not null;check:month BETWEEN 1 AND 12;uniqueIndex:uq_survey_periods_org_month_year,priority:2" json:"month"`

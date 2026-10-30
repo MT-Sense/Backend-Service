@@ -54,55 +54,40 @@ func NewPositions(positions []models.Position) []Position {
 // --- HR KPIs ---
 
 type EnpsKpi struct {
-	Value            int `json:"value"`
-	DeltaVsLastMonth int `json:"deltaVsLastMonth"`
+	Value            *int `json:"value"`
+	DeltaVsLastMonth *int `json:"deltaVsLastMonth"`
 }
 
 type SatisfactionKpi struct {
-	Value float64 `json:"value"`
-	Trend string  `json:"trend"` // up | down | flat
+	Value *float64 `json:"value"`
+	Trend *string  `json:"trend"` // up | down | flat
 }
 
 type BurnoutKpi struct {
-	Percentage        int `json:"percentage"`
-	DepartmentsAtRisk int `json:"departmentsAtRisk"`
+	Percentage        *int `json:"percentage"`
+	DepartmentsAtRisk *int `json:"departmentsAtRisk"`
 }
 
 type ResponseRateKpi struct {
-	Percentage int   `json:"percentage"`
-	Responded  int64 `json:"responded"`
-	Total      int64 `json:"total"`
+	Percentage *int   `json:"percentage"`
+	Responded  *int64 `json:"responded"`
+	Total      *int64 `json:"total"`
 }
 
-type TrendPoint struct {
-	Month        string  `json:"month"`
-	Enps         int     `json:"enps"`
-	Satisfaction float64 `json:"satisfaction"`
-	ResponseRate int     `json:"responseRate"`
-	BurnoutRisk  int     `json:"burnoutRisk"`
-	HasResponses bool    `json:"hasResponses"`
-}
+type TrendPoint = analytics.TrendPoint
 
 // HrKpis mirrors the frontend's HrKpis type.
 type HrKpis struct {
+	DataState    string          `json:"dataState"`
 	Enps         EnpsKpi         `json:"enps"`
 	Satisfaction SatisfactionKpi `json:"satisfaction"`
 	BurnoutRisk  BurnoutKpi      `json:"burnoutRisk"`
 	ResponseRate ResponseRateKpi `json:"responseRate"`
-	Sentiment    Sentiment       `json:"sentiment"`
+	Sentiment    *Sentiment      `json:"sentiment"`
 	Trend        []TrendPoint    `json:"trend"`
 }
 
-func NewTrend(points []analytics.TrendPoint) []TrendPoint {
-	out := make([]TrendPoint, 0, len(points))
-	for _, p := range points {
-		out = append(out, TrendPoint{
-			Month: p.Month, Enps: p.ENPS, Satisfaction: p.Satisfaction,
-			ResponseRate: p.ResponseRate, BurnoutRisk: p.BurnoutRisk, HasResponses: p.HasResponses,
-		})
-	}
-	return out
-}
+func NewTrend(points []analytics.TrendPoint) []TrendPoint { return points }
 
 // --- heatmap ---
 
@@ -271,9 +256,9 @@ func NewSubIssues(issues []models.TopicSubIssue) []TopicSubIssue {
 // --- executive summary ---
 
 type RadarAxis struct {
-	TopicID   string  `json:"topicId"`
-	ThisMonth float64 `json:"thisMonth"`
-	LastMonth float64 `json:"lastMonth"`
+	TopicID   string   `json:"topicId"`
+	ThisMonth *float64 `json:"thisMonth"`
+	LastMonth *float64 `json:"lastMonth"`
 }
 
 type DepartmentScore struct {
@@ -301,8 +286,8 @@ type DecisionItem struct {
 // that could carry an individual's words, so the Executive restriction holds at the type
 // level and not merely by handler discipline.
 type ExecutiveSummary struct {
-	Score                int               `json:"score"`
-	Sentiment            Sentiment         `json:"sentiment"`
+	Score                *int              `json:"score"`
+	Sentiment            *Sentiment        `json:"sentiment"`
 	Radar                []RadarAxis       `json:"radar"`
 	DepartmentComparison []DepartmentScore `json:"departmentComparison"`
 	PositionComparison   []PositionScore   `json:"positionComparison"`

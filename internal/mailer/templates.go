@@ -114,19 +114,21 @@ Your answer is never linked to your name or email; HR only sees aggregates of 5 
 // SummaryMetrics is the org-wide snapshot a leader can email. Everything is an aggregate;
 // when Suppressed is set (fewer than models.MinGroupSize respondents) no score is shown.
 type SummaryMetrics struct {
-	Month, Year       int
-	Respondents       int64
-	Headcount         int64
-	ResponseRate      int
-	Suppressed        bool
-	Satisfaction      float64
-	ENPS              int
-	Positive          int
-	Neutral           int
-	Negative          int
-	BurnoutRisk       int
-	DepartmentsAtRisk int
-	OpenAlerts        int64
+	ResponseRateAvailable bool
+	SentimentAvailable    bool
+	Month, Year           int
+	Respondents           int64
+	Headcount             int64
+	ResponseRate          int
+	Suppressed            bool
+	Satisfaction          float64
+	ENPS                  int
+	Positive              int
+	Neutral               int
+	Negative              int
+	BurnoutRisk           int
+	DepartmentsAtRisk     int
+	OpenAlerts            int64
 }
 
 type summaryData struct {
@@ -152,11 +154,11 @@ func renderSummary(baseURL, dashboardPath, name, orgName, senderName, note strin
 {{if .Note}}
 "{{.Note}}"
 {{end}}
-ผู้ตอบ / Respondents: {{.Respondents}} / {{.Headcount}} ({{.ResponseRate}}%)
+ผู้ตอบ / Respondents: {{if .Suppressed}}—{{else}}{{.Respondents}}{{end}}{{if and .ResponseRateAvailable (not .Suppressed)}} / {{.Headcount}} ({{.ResponseRate}}%) · ฐานบัญชี ณ วันสร้างรอบ / accounts at round creation{{else}} · ไม่มีข้อมูลสำหรับแสดงอัตราการตอบ / Response rate unavailable{{end}}
 {{if .Suppressed}}ผู้ตอบไม่ถึง 5 คน จึงยังไม่แสดงคะแนน / Fewer than 5 responses, so scores are hidden.
 {{else}}ความพึงพอใจเฉลี่ย / Average satisfaction: {{.SatisfactionText}} / 5
 eNPS: {{.ENPS}}
-ความรู้สึก / Sentiment: บวก positive {{.Positive}}% · กลาง neutral {{.Neutral}}% · ลบ negative {{.Negative}}%
+ความรู้สึก / Sentiment: {{if .SentimentAvailable}}บวก positive {{.Positive}}% · กลาง neutral {{.Neutral}}% · ลบ negative {{.Negative}}%{{else}}ยังมีข้อมูลไม่เพียงพอสำหรับแสดงผล / Not enough data to display{{end}}
 เสี่ยงหมดไฟ / Burnout risk: {{.BurnoutRisk}}% ({{.DepartmentsAtRisk}} แผนก / departments)
 การแจ้งเตือนที่ยังเปิดอยู่ / Open alerts: {{.OpenAlerts}}
 {{end}}
@@ -166,11 +168,11 @@ eNPS: {{.ENPS}}
 <p style="margin:0 0 16px;color:#52606d">{{.SenderName}} shared the {{.OrgName}} survey summary for {{.Period}}.</p>
 {{if .Note}}<blockquote style="margin:0 0 16px;padding:10px 14px;border-left:3px solid #3b5bdb;background:#f0f4ff;white-space:pre-line">{{.Note}}</blockquote>{{end}}
 <table role="presentation" width="100%" cellpadding="8" cellspacing="0" style="border-collapse:collapse;font-size:14px">
-<tr style="border-bottom:1px solid #e4e7eb"><td>ผู้ตอบ · Respondents</td><td align="right"><strong>{{.Respondents}} / {{.Headcount}}</strong> ({{.ResponseRate}}%)</td></tr>
+<tr style="border-bottom:1px solid #e4e7eb"><td>ผู้ตอบ · Respondents</td><td align="right"><strong>{{if .Suppressed}}—{{else}}{{.Respondents}}{{end}}</strong>{{if and .ResponseRateAvailable (not .Suppressed)}} / {{.Headcount}} ({{.ResponseRate}}%)<br>ฐานบัญชี ณ วันสร้างรอบ / accounts at round creation{{else}}<br>ไม่มีข้อมูลสำหรับแสดงอัตราการตอบ / Response rate unavailable{{end}}</td></tr>
 {{if .Suppressed}}<tr><td colspan="2" style="color:#52606d">ผู้ตอบไม่ถึง 5 คน จึงยังไม่แสดงคะแนน<br>Fewer than 5 responses, so scores are hidden.</td></tr>
 {{else}}<tr style="border-bottom:1px solid #e4e7eb"><td>ความพึงพอใจเฉลี่ย · Avg satisfaction</td><td align="right"><strong>{{.SatisfactionText}}</strong> / 5</td></tr>
 <tr style="border-bottom:1px solid #e4e7eb"><td>eNPS</td><td align="right"><strong>{{.ENPS}}</strong></td></tr>
-<tr style="border-bottom:1px solid #e4e7eb"><td>ความรู้สึก · Sentiment</td><td align="right">+{{.Positive}}% · {{.Neutral}}% · −{{.Negative}}%</td></tr>
+<tr style="border-bottom:1px solid #e4e7eb"><td>ความรู้สึก · Sentiment</td><td align="right">{{if .SentimentAvailable}}+{{.Positive}}% · {{.Neutral}}% · −{{.Negative}}%{{else}}ยังมีข้อมูลไม่เพียงพอสำหรับแสดงผล / Not enough data to display{{end}}</td></tr>
 <tr style="border-bottom:1px solid #e4e7eb"><td>เสี่ยงหมดไฟ · Burnout risk</td><td align="right"><strong>{{.BurnoutRisk}}%</strong> ({{.DepartmentsAtRisk}})</td></tr>
 <tr><td>การแจ้งเตือนที่เปิดอยู่ · Open alerts</td><td align="right"><strong>{{.OpenAlerts}}</strong></td></tr>{{end}}
 </table>

@@ -134,6 +134,22 @@ func TestNewRoundRender(t *testing.T) {
 	}
 }
 
+func TestSummaryUnavailableMetricsAreExplicit(t *testing.T) {
+	r, err := renderSummary("https://app.example.com", "/dashboard", "Exec", "ACME", "HR", "",
+		SummaryMetrics{Month: 10, Year: 2026, Respondents: 5, Satisfaction: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{r.HTML, r.Text} {
+		if !strings.Contains(body, "Response rate unavailable") || !strings.Contains(body, "Not enough data to display") {
+			t.Fatal("missing metric explanation")
+		}
+		if strings.Contains(body, "5 / 0") || strings.Contains(body, "positive 0%") {
+			t.Fatal("unavailable metric rendered as a measured zero")
+		}
+	}
+}
+
 // fakeSMTP is a minimal plaintext SMTP server that records one message.
 func fakeSMTP(t *testing.T, rcptCode int) (port int, received <-chan string) {
 	t.Helper()

@@ -293,3 +293,13 @@ dropdb mtsense && createdb mtsense && go run ./cmd/server
 - **Multi-tenant login จริง** — org_id ผูกทุก query แล้ว แต่ยังไม่มีหน้าเลือกบริษัทก่อน login
   (ตอนนี้ resolve จาก organization แถวเดียวที่ seed ไว้)
 - **Refresh token** rotate แล้ว (ใช้ซ้ำไม่ได้) แต่ยังไม่ได้ทำ reuse-detection ที่เพิกถอนทั้ง family
+
+### Dashboard: ข้อมูลไม่พอและฐานอัตราการตอบ
+
+- คะแนนและ sentiment ที่ไม่มีข้อมูลหรือมีผู้ตอบไม่ถึง 5 คนส่งเป็น `null` รวมถึงจุดย้อนหลังและ Radar; sentiment ตรวจจำนวนคำตอบที่วิเคราะห์แล้วแยกต่างหาก
+- เปอร์เซ็นต์ sentiment ใช้ largest remainders เพื่อให้รวม 100 และไม่ติดลบ
+- รอบใหม่ที่สร้างผ่าน API เก็บ `survey_periods.response_audience` ใน transaction เดียวกับการสร้างรอบ เป็นจำนวนบัญชี active ณ วันสร้างรอบ แยกองค์กร/แผนก ไม่มีข้อมูลระบุตัวบุคคล
+- ตัวหารนี้เป็นฐานบัญชี ณ วันสร้างรอบ ไม่ใช่รายชื่อผู้มีสิทธิ์แบบรายบุคคล ไม่เปลี่ยนย้อนหลังเมื่อย้ายแผนกหรือปิดบัญชี และไม่จำกัดสิทธิ์ส่งคำตอบของบัญชีที่เข้าร่วมภายหลัง
+- รอบเดิมไม่มีการสร้าง snapshot ย้อนหลังจากสมาชิกปัจจุบัน อัตราการตอบเป็น `null` เมื่อไม่มี snapshot, มีข้อมูลนำเข้า, ฐานเป็นศูนย์ หรือคำตอบเกินฐาน ไม่มีการตัดค่าให้เหลือ 100%
+- Restart backend เพื่อให้ AutoMigrate เพิ่มคอลัมน์ nullable นี้ ข้อมูลคำตอบเดิมยังคงอยู่; deploy frontend/backend พร้อมกันเพราะ metric fields รองรับ `null` แล้ว
+- ทดสอบ PostgreSQL แยกด้วย `METRICS_TEST_DATABASE_URL` และ `go test ./internal/handlers -run TestDashboardMetricPrivacyAndAudience -count=1`

@@ -117,33 +117,29 @@ func (s *Service) lowSatisfactionPositionAlerts(tx *gorm.DB, period *models.Surv
 	for _, r := range rows {
 		posID := r.PositionID
 		out = append(out, models.Alert{
-			ID:                 uuid.NewString(),
-			OrgID:              s.orgID,
-			PeriodID:           period.ID,
-			AlertType:          models.AlertLowSatisfactionPosition,
-			Severity:           severityFor(r.Score),
-			Message:            fmt.Sprintf("ตำแหน่งมีคะแนนความพึงพอใจเฉลี่ย %.1f/5 ต่ำกว่าเกณฑ์", r.Score),
-			RelatedPositionID:  &posID,
-			CreatedAt:          now,
+			ID:                uuid.NewString(),
+			OrgID:             s.orgID,
+			PeriodID:          period.ID,
+			AlertType:         models.AlertLowSatisfactionPosition,
+			Severity:          severityFor(r.Score),
+			Message:           fmt.Sprintf("ตำแหน่งมีคะแนนความพึงพอใจเฉลี่ย %.1f/5 ต่ำกว่าเกณฑ์", r.Score),
+			RelatedPositionID: &posID,
+			CreatedAt:         now,
 		})
 	}
 	return out, nil
 }
 
 func (s *Service) lowResponseRateAlert(tx *gorm.DB, period *models.SurveyPeriod) (*models.Alert, error) {
-	responded, err := s.TotalRespondents(period.ID)
+	scoped := New(tx).WithOrg(s.orgID)
+	responded, headcount, percentage, err := scoped.ResponseRate(period.ID, "")
 	if err != nil {
 		return nil, err
 	}
-	var headcount int64
-	err = tx.Model(&models.User{}).Where("org_id = ? AND is_active = ?", s.orgID, true).Count(&headcount).Error
-	if err != nil {
-		return nil, err
-	}
-	if headcount == 0 {
+	if percentage == nil || headcount == nil || responded < privacy.MinGroupSizeSQL {
 		return nil, nil
 	}
-	rate := float64(responded) / float64(headcount)
+	rate := float64(responded) / float64(*headcount)
 	if rate >= lowResponseRateThreshold {
 		return nil, nil
 	}
@@ -162,6 +158,17 @@ func (s *Service) sentimentDropAlert(period *models.SurveyPeriod) (*models.Alert
 	prev, err := s.PreviousPeriod(period)
 	if err != nil || prev == nil {
 		return nil, err
+	}
+	currentN, err := s.AnalyzedRespondents(period.ID)
+	if err != nil {
+		return nil, err
+	}
+	previousN, err := s.AnalyzedRespondents(prev.ID)
+	if err != nil {
+		return nil, err
+	}
+	if currentN < privacy.MinGroupSizeSQL || previousN < privacy.MinGroupSizeSQL {
+		return nil, nil
 	}
 	current, err := s.SentimentSplit(period.ID)
 	if err != nil {

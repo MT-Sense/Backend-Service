@@ -54,7 +54,7 @@ func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) *Workers {
 
 	authH := handlers.NewAuthHandler(db, issuer, mail)
 	usersH := handlers.NewUsersHandler(db, mail)
-	dashH := handlers.NewDashboardHandler(db, stats, ai)
+	dashH := handlers.NewDashboardHandler(db, stats, ai, cfg.AutomationServiceToken)
 	surveyH := handlers.NewSurveyHandler(db, stats, analysisQueue)
 	trainingH := handlers.NewModelTrainingHandler(db, ai, cfg.AITrainingToken)
 	feedH := handlers.NewFeedHandler(db, cfg.JWTSecret)
@@ -126,6 +126,10 @@ func Register(app *fiber.App, db *gorm.DB, cfg *config.Config) *Workers {
 	r.Get("/dashboard/hr/alerts", adminOnly, dashH.Alerts)
 	r.Get("/dashboard/hr/extra-questions", adminOnly, dashH.ExtraQuestions)
 	r.Get("/dashboard/hr/topics/:id", adminOnly, dashH.TopicDrilldown)
+	r.Post("/dashboard/hr/topics/:id/summary", adminOnly, limiter.New(limiter.Config{
+		Max: 3, Expiration: time.Minute,
+		KeyGenerator: func(c *fiber.Ctx) string { return middleware.OrgID(c) + ":" + middleware.UserID(c) },
+	}), dashH.GenerateTopicSummary)
 	// Account management: profile, department, role and access only — no survey data.
 	r.Get("/hr/users", adminOnly, usersH.List)
 	r.Post("/hr/users", adminOnly, usersH.Create)

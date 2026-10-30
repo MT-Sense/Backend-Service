@@ -26,6 +26,7 @@ func (s *Service) GenerateInsight(period *models.SurveyPeriod) (*models.AIInsigh
 	err := s.db.Table("survey_responses").
 		Joins("JOIN response_analysis ON response_analysis.response_id = survey_responses.id").
 		Where("survey_responses.org_id = ? AND survey_responses.period_id = ?", s.orgID, period.ID).
+		Having("COUNT(*) >= ?", privacy.MinGroupSizeSQL).
 		Select(`
 			AVG(survey_responses.satisfaction_score) AS average,
 			COUNT(*) FILTER (WHERE response_analysis.sentiment_label = 'pos') AS positive,
@@ -94,8 +95,9 @@ func (s *Service) insightTopics(periodID string, analyzed int64) ([]models.Issue
 		CROSS JOIN LATERAL jsonb_array_elements_text(response_analysis.categories::jsonb) AS category(value)
 		WHERE survey_responses.org_id = ? AND survey_responses.period_id = ?
 		GROUP BY category.value
+        HAVING COUNT(DISTINCT survey_responses.id) >= ?
 		ORDER BY count DESC, category.value
-		LIMIT 3`, s.orgID, periodID).Scan(&rows).Error
+		LIMIT 3`, s.orgID, periodID, privacy.MinGroupSizeSQL).Scan(&rows).Error
 	if err != nil {
 		return nil, err
 	}

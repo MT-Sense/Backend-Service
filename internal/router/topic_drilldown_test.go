@@ -2,16 +2,20 @@ package router
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"github.com/mt-sense/backend-service/internal/aiservice"
 	"github.com/mt-sense/backend-service/internal/auth"
 	"github.com/mt-sense/backend-service/internal/config"
 	"github.com/mt-sense/backend-service/internal/database"
@@ -75,16 +79,61 @@ func TestTopicDrilldownScope(t *testing.T) {
 	mustCreate(&models.SurveyResponse{ID: uuid.NewString(), OrgID: org, PeriodID: periods[11], DepartmentID: &sales, SatisfactionScore: 1, CommentText: "Pending", AnalysisStatus: "pending", SubmittedAt: time.Now()})
 	// Old sub-issue rows are deliberately unscoped and must not enter this response.
 	mustCreate(&models.TopicSubIssue{ID: uuid.NewString(), TopicID: topic, Label: models.Localized{TH: "Old seed", EN: "Old seed"}, Percentage: 99})
-	cfg := &config.Config{JWTSecret: strings.Repeat("t", 32), AccessTTL: time.Hour, RefreshTTL: time.Hour}
+	var summaryCalls, sampled atomic.Int32
+	var invalidEvidence atomic.Bool
+	summaryAI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		summaryCalls.Add(1)
+		if request.URL.Path != "/topics/summarize" || request.Header.Get("X-Automation-Token") != "summary-test-token" {
+			t.Error("wrong AI endpoint or service authentication")
+			w.WriteHeader(403)
+			return
+		}
+		raw, _ := io.ReadAll(request.Body)
+		var payload map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &payload); err != nil || len(payload) != 2 || payload["topic"] == nil || payload["comments"] == nil {
+			t.Error("unapproved fields sent to AI", string(raw))
+		}
+		for _, forbidden := range []string{org, foreign, periods[11], it, sales, "test@example.com", "OTHER", "FOREIGN", "OLD"} {
+			if strings.Contains(string(raw), forbidden) {
+				t.Error("scope, redaction or database-ID boundary failed", forbidden)
+			}
+		}
+		var input aiservice.TopicSummaryRequest
+		if err := json.Unmarshal(raw, &input); err != nil {
+			t.Error(err)
+			w.WriteHeader(400)
+			return
+		}
+		sampled.Store(int32(len(input.Comments)))
+		if len(input.Comments) < 5 || len(input.Comments) > 120 {
+			t.Error("wrong summary batch size")
+		}
+		theme := aiservice.TopicTheme{TitleTH: "การวางแผนงาน", TitleEN: "Work planning", SummaryTH: "ความคิดเห็นกล่าวถึงการวางแผนงาน", SummaryEN: "Comments mention planning"}
+		for index, comment := range input.Comments {
+			if comment.Ref != fmt.Sprintf("c%d", index+1) {
+				t.Error("not a temporary reference", comment.Ref)
+			}
+			if index < 5 {
+				theme.Evidence = append(theme.Evidence, aiservice.TopicCitation{Ref: comment.Ref, Excerpt: "IT feedback contact"})
+			}
+		}
+		if invalidEvidence.Load() {
+			theme.Evidence[0].Ref = "not-in-input"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(aiservice.TopicSummaryResult{Themes: []aiservice.TopicTheme{theme}})
+	}))
+	defer summaryAI.Close()
+	cfg := &config.Config{JWTSecret: strings.Repeat("t", 32), AccessTTL: time.Hour, RefreshTTL: time.Hour, AIServiceURL: summaryAI.URL, AutomationServiceToken: "summary-test-token"}
 	app := fiber.New()
 	Register(app, db, cfg)
 	issuer := auth.NewIssuer(cfg.JWTSecret, time.Hour, time.Hour)
 	admin, _, _ := issuer.AccessToken("admin", org, models.RoleAdmin)
 	employee, _, _ := issuer.AccessToken("employee", org, models.RoleEmployee)
 	executive, _, _ := issuer.AccessToken("executive", org, models.RoleExecutive)
-	call := func(path, token string, want int) []byte {
+	callMethod := func(method, path, token string, want int) []byte {
 		t.Helper()
-		req := httptest.NewRequest("GET", "/api/dashboard/hr/topics/"+path, nil)
+		req := httptest.NewRequest(method, "/api/dashboard/hr/topics/"+path, nil)
 		if token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
@@ -102,6 +151,7 @@ func TestTopicDrilldownScope(t *testing.T) {
 		}
 		return body
 	}
+	call := func(path, token string, want int) []byte { t.Helper(); return callMethod("GET", path, token, want) }
 	type result struct {
 		TopicID, PeriodID, DepartmentID     string
 		Score, CompanyAverage               float64
@@ -165,6 +215,44 @@ func TestTopicDrilldownScope(t *testing.T) {
 	}
 	call(topic+"?period="+foreignPeriod, admin, 404)
 	call(path+"&department=foreign-department", admin, 404)
+	if summaryCalls.Load() != 0 {
+		t.Fatal("GET drilldown triggered an AI summary")
+	}
+	// Generation is explicit, HR-only, scope-checked and capped before leaving the backend.
+	summaryPath := topic + "/summary?period=" + periods[11] + "&department=" + it
+	callMethod("POST", summaryPath, "", 401)
+	callMethod("POST", summaryPath, employee, 403)
+	callMethod("POST", summaryPath, executive, 403)
+	seed(org, periods[11], it, topic, "pos", "IT feedback contact test@example.com", 2, 121)
+	var generated struct {
+		SampledComments int
+		Themes          []struct {
+			SupportingCount int
+			Excerpts        []string
+		}
+	}
+	if err := json.Unmarshal(callMethod("POST", summaryPath, admin, 200), &generated); err != nil {
+		t.Fatal(err)
+	}
+	if sampled.Load() != 120 || generated.SampledComments != 120 || len(generated.Themes) != 1 || generated.Themes[0].SupportingCount != 5 {
+		t.Fatalf("invalid summary cap or evidence: %+v", generated)
+	}
+	callMethod("POST", topic+"/summary?period="+periods[11]+"&department="+small, admin, 422)
+	if summaryCalls.Load() != 1 {
+		t.Fatal("small group was sent to AI")
+	}
+	invalidEvidence.Store(true)
+	callMethod("POST", summaryPath, admin, 502)
+	callMethod("POST", summaryPath, admin, 429)
+	if summaryCalls.Load() != 2 {
+		t.Fatal("rate limit did not stop model call")
+	}
+	anotherAdmin, _, _ := issuer.AccessToken("fresh-admin", org, models.RoleAdmin)
+	callMethod("POST", topic+"/summary?period="+foreignPeriod, anotherAdmin, 404)
+	callMethod("POST", summaryPath+"-foreign", anotherAdmin, 404)
+	if summaryCalls.Load() != 2 {
+		t.Fatal("foreign scope reached AI")
+	}
 	// Every cleanup targets only records created by this test.
 	t.Cleanup(func() {
 		for _, model := range []any{&models.ResponseAnalysis{}, &models.TopicSubIssue{}} {

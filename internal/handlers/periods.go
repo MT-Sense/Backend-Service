@@ -85,6 +85,9 @@ func (h *PeriodsHandler) Create(c *fiber.Ctx) error {
 		EnabledExtraQuestions: req.EnabledExtraQuestions,
 	}
 	if err := h.db.Transaction(func(tx *gorm.DB) error {
+		if err := analytics.CapturePeriodAudience(tx, &period); err != nil {
+			return err
+		}
 		if err := tx.Create(&period).Error; err != nil {
 			return err
 		}

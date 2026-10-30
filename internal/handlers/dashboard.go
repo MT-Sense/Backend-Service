@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"errors"
 	"math"
 	"sort"
 	"strings"
@@ -18,13 +17,18 @@ import (
 )
 
 type DashboardHandler struct {
-	db    *gorm.DB
-	stats *analytics.Service
-	ai    *aiservice.Client
+	db           *gorm.DB
+	stats        *analytics.Service
+	ai           *aiservice.Client
+	summaryToken string
 }
 
-func NewDashboardHandler(db *gorm.DB, stats *analytics.Service, ai *aiservice.Client) *DashboardHandler {
-	return &DashboardHandler{db: db, stats: stats, ai: ai}
+func NewDashboardHandler(db *gorm.DB, stats *analytics.Service, ai *aiservice.Client, summaryToken ...string) *DashboardHandler {
+	h := &DashboardHandler{db: db, stats: stats, ai: ai}
+	if len(summaryToken) > 0 {
+		h.summaryToken = summaryToken[0]
+	}
+	return h
 }
 
 // resolvePeriod reads ?period=<id>, defaulting to the org's latest survey period.
@@ -44,40 +48,7 @@ func (h *DashboardHandler) HRKpis(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusNotFound, "no survey period found")
 	}
 
-	enps, err := stats.ENPS(period.ID)
-	if err != nil {
-		return err
-	}
-	prevENPSValue := 0
-	if prev, err := stats.PreviousPeriod(period); err != nil {
-		return err
-	} else if prev != nil {
-		prevENPS, err := stats.ENPS(prev.ID)
-		if err != nil {
-			return err
-		}
-		prevENPSValue = prevENPS.Value
-	}
-
-	satisfaction, err := stats.SatisfactionAverage(period.ID)
-	if err != nil {
-		return err
-	}
-	prevSatisfaction := 0.0
-	if prev, err := stats.PreviousPeriod(period); err != nil {
-		return err
-	} else if prev != nil {
-		prevSatisfaction, err = stats.SatisfactionAverage(prev.ID)
-		if err != nil {
-			return err
-		}
-	}
-
-	burnoutPct, deptsAtRisk, err := stats.BurnoutRisk(period.ID)
-	if err != nil {
-		return err
-	}
-	sentiment, err := stats.SentimentSplit(period.ID)
+	responded, total, rate, err := stats.ResponseRate(period.ID, "")
 	if err != nil {
 		return err
 	}
@@ -85,41 +56,67 @@ func (h *DashboardHandler) HRKpis(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-
-	responded, err := stats.TotalRespondents(period.ID)
+	result := dto.HrKpis{DataState: "available", Trend: dto.NewTrend(trend),
+		ResponseRate: dto.ResponseRateKpi{Total: total}}
+	if responded == 0 {
+		result.DataState = "empty"
+		result.ResponseRate.Responded = &responded
+		result.ResponseRate.Percentage = rate
+	} else if responded < models.MinGroupSize {
+		result.DataState = "suppressed"
+	} else {
+		result.ResponseRate.Responded, result.ResponseRate.Percentage = &responded, rate
+		enps, err := stats.ENPS(period.ID)
+		if err != nil {
+			return err
+		}
+		satisfaction, err := stats.SatisfactionAverage(period.ID)
+		if err != nil {
+			return err
+		}
+		risk, departments, err := stats.BurnoutRisk(period.ID)
+		if err != nil {
+			return err
+		}
+		result.Enps.Value = &enps.Value
+		result.Satisfaction.Value = &satisfaction
+		result.BurnoutRisk.Percentage, result.BurnoutRisk.DepartmentsAtRisk = &risk, &departments
+		previous, err := stats.PreviousPeriod(period)
+		if err != nil {
+			return err
+		}
+		if previous != nil {
+			previousN, err := stats.TotalRespondents(previous.ID)
+			if err != nil {
+				return err
+			}
+			if previousN >= models.MinGroupSize {
+				previousENPS, err := stats.ENPS(previous.ID)
+				if err != nil {
+					return err
+				}
+				previousSat, err := stats.SatisfactionAverage(previous.ID)
+				if err != nil {
+					return err
+				}
+				delta := enps.Value - previousENPS.Value
+				direction := trendDirection(satisfaction, previousSat)
+				result.Enps.DeltaVsLastMonth, result.Satisfaction.Trend = &delta, &direction
+			}
+		}
+	}
+	analyzed, err := stats.AnalyzedRespondents(period.ID)
 	if err != nil {
 		return err
 	}
-	var headcount int64
-	if err := h.db.Model(&models.User{}).Where("org_id = ? AND is_active = ?", orgID, true).Count(&headcount).Error; err != nil {
-		return err
+	if analyzed >= models.MinGroupSize {
+		sentiment, err := stats.SentimentSplit(period.ID)
+		if err != nil {
+			return err
+		}
+		result.Sentiment = &sentiment
 	}
-	responseRate := 0
-	if headcount > 0 {
-		responseRate = int(float64(responded) / float64(headcount) * 100)
-	}
-
-	return c.JSON(dto.HrKpis{
-		Enps: dto.EnpsKpi{
-			Value:            enps.Value,
-			DeltaVsLastMonth: enps.Value - prevENPSValue,
-		},
-		Satisfaction: dto.SatisfactionKpi{
-			Value: satisfaction,
-			Trend: trendDirection(satisfaction, prevSatisfaction),
-		},
-		BurnoutRisk: dto.BurnoutKpi{
-			Percentage:        burnoutPct,
-			DepartmentsAtRisk: deptsAtRisk,
-		},
-		ResponseRate: dto.ResponseRateKpi{
-			Percentage: responseRate,
-			Responded:  responded,
-			Total:      headcount,
-		},
-		Sentiment: sentiment,
-		Trend:     dto.NewTrend(trend),
-	})
+	return c.JSON(result)
 }
 
 // DepartmentTrend returns only privacy-safe monthly aggregates for a department.
@@ -273,20 +270,6 @@ func (h *DashboardHandler) DepartmentSummary(c *fiber.Ctx) error {
 			return err
 		}
 	}
-	var headcounts []struct {
-		DepartmentID string
-		Total        int64
-	}
-	if err := h.db.Model(&models.User{}).
-		Select("department_id, COUNT(*) AS total").
-		Where("org_id = ? AND is_active = ? AND department_id IS NOT NULL", orgID, true).
-		Group("department_id").Scan(&headcounts).Error; err != nil {
-		return err
-	}
-	totals := make(map[string]int64, len(headcounts))
-	for _, item := range headcounts {
-		totals[item.DepartmentID] = item.Total
-	}
 	rows := make([]dto.DepartmentSummaryRow, 0, len(departments)+1)
 	appendRow := func(id, name string, responded int64, total *int64) {
 		row := dto.DepartmentSummaryRow{
@@ -309,8 +292,11 @@ func (h *DashboardHandler) DepartmentSummary(c *fiber.Ctx) error {
 		rows = append(rows, row)
 	}
 	for _, department := range departments {
-		total := totals[department.ID]
-		appendRow(department.ID, department.Name, counts[department.ID], &total)
+		_, total, _, err := stats.ResponseRate(period.ID, department.ID)
+		if err != nil {
+			return err
+		}
+		appendRow(department.ID, department.Name, counts[department.ID], total)
 	}
 	unassigned, err := stats.UnassignedRespondentCount(period.ID)
 	if err != nil {
@@ -543,40 +529,13 @@ func (h *DashboardHandler) topicUnavailable(c *fiber.Ctx, orgID, periodID, messa
 // TopicDrilldown is HR-only: it is the one endpoint that returns sample text, and even
 // there the text was redacted before it was stored.
 func (h *DashboardHandler) TopicDrilldown(c *fiber.Ctx) error {
-	orgID := middleware.OrgID(c)
-	statsSvc := h.stats.WithOrg(orgID)
-	period, err := h.resolvePeriod(c, statsSvc)
+	scope, err := h.resolveTopicSelection(c)
 	if err != nil {
-		return fiber.NewError(fiber.StatusNotFound, "no survey period found")
+		return err
 	}
-	topicID := c.Params("id")
-
-	var topicLabel models.Localized
-	var topic models.Topic
-	if err := h.db.First(&topic, "id = ?", topicID).Error; err == nil {
-		topicLabel = topic.Label
-	} else {
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return err
-		}
-		var emerging models.EmergingTopic
-		if err := h.db.Where("org_id = ? AND id = ?", orgID, topicID).First(&emerging).Error; err != nil {
-			return fiber.NewError(fiber.StatusNotFound, "unknown topic")
-		}
-		topicLabel = emerging.Label
-	}
-	departmentID := c.Query("department")
-	departmentName := ""
-	if departmentID != "" {
-		departmentName = "Unassigned"
-		if departmentID != analytics.UnassignedDepartmentID {
-			var department models.Department
-			if err := h.db.Where("org_id = ? AND id = ?", orgID, departmentID).First(&department).Error; err != nil {
-				return fiber.NewError(fiber.StatusNotFound, "unknown department")
-			}
-			departmentName = department.Name
-		}
-	}
+	orgID, period, topicID := scope.OrgID, scope.Period, scope.TopicID
+	topicLabel, departmentID, departmentName := scope.Label, scope.DepartmentID, scope.DepartmentName
+	statsSvc := h.stats.WithOrg(orgID)
 	detail, err := statsSvc.DepartmentTopicDetail(period, topicID, departmentID)
 	if err != nil {
 		return err
@@ -624,9 +583,17 @@ func (h *DashboardHandler) ExecutiveSummary(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	sentiment, err := stats.SentimentSplit(period.ID)
+	var sentiment *dto.Sentiment
+	analyzed, err := stats.AnalyzedRespondents(period.ID)
 	if err != nil {
 		return err
+	}
+	if analyzed >= models.MinGroupSize {
+		value, err := stats.SentimentSplit(period.ID)
+		if err != nil {
+			return err
+		}
+		sentiment = &value
 	}
 	radar, err := stats.Radar(period, topics)
 	if err != nil {
