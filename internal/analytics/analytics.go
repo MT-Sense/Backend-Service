@@ -686,10 +686,11 @@ func (s *Service) OverallHealthScore(periodID string) (int, error) {
 // ---------------------------------------------------------------------------
 
 type TopicStats struct {
-	Score            float64
-	CompanyAverage   float64
-	RespondentCount  int64
-	PercentageTagged int
+	Score              float64
+	CompanyAverage     float64
+	RespondentCount    int64
+	PercentageTagged   int
+	ScopeResponseCount int64
 }
 
 type DepartmentTopicDetail struct {
@@ -717,7 +718,7 @@ func (s *Service) departmentTopicResponses(periodID, topicID, departmentID strin
 		)`, string(containsTopic), topicID)
 	if departmentID == UnassignedDepartmentID {
 		query = query.Where("survey_responses.department_id IS NULL")
-	} else {
+	} else if departmentID != "" {
 		query = query.Where("survey_responses.department_id = ?", departmentID)
 	}
 	return query, nil
@@ -732,15 +733,16 @@ func (s *Service) departmentTopicScore(periodID, topicID, departmentID string) (
 		Score       float64
 		Respondents int64
 	}
-	result := query.Group("survey_responses.department_id").
+	result := query.Group("survey_responses.period_id").
 		Having("COUNT(DISTINCT survey_responses.id) >= ?", privacy.MinGroupSizeSQL).
 		Select("ROUND(AVG(survey_responses.satisfaction_score)::numeric, 1)::float8 AS score, COUNT(DISTINCT survey_responses.id) AS respondents").
 		Scan(&row)
 	return row.Score, row.Respondents, result.RowsAffected > 0, result.Error
 }
 
-// DepartmentTopicDetail returns data only when this department/topic/period has at
-// least five distinct responses. The same gate is applied separately to trend points.
+// DepartmentTopicDetail returns data only when the selected topic/period/scope has
+// at least five distinct responses. Empty departmentID selects the whole organization.
+// Every metric, sentiment and quote uses this same scope; trend points are gated separately.
 func (s *Service) DepartmentTopicDetail(period *models.SurveyPeriod, topicID, departmentID string) (*DepartmentTopicDetail, error) {
 	score, n, visible, err := s.departmentTopicScore(period.ID, topicID, departmentID)
 	if err != nil || !visible {
@@ -758,12 +760,13 @@ func (s *Service) DepartmentTopicDetail(period *models.SurveyPeriod, topicID, de
 	totalQuery := s.db.Model(&models.SurveyResponse{}).Where("org_id = ? AND period_id = ?", s.orgID, period.ID)
 	if departmentID == UnassignedDepartmentID {
 		totalQuery = totalQuery.Where("department_id IS NULL")
-	} else {
+	} else if departmentID != "" {
 		totalQuery = totalQuery.Where("department_id = ?", departmentID)
 	}
 	if err := totalQuery.Count(&total).Error; err != nil {
 		return nil, err
 	}
+	detail.ScopeResponseCount = total
 	if total > 0 {
 		detail.PercentageTagged = int(round(float64(n)/float64(total)*100, 0))
 	}

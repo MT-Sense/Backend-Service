@@ -1,6 +1,8 @@
 package dto
 
 import (
+	"fmt"
+
 	"github.com/mt-sense/backend-service/internal/analytics"
 	"github.com/mt-sense/backend-service/internal/models"
 )
@@ -202,8 +204,8 @@ func NewWordCloud(terms []models.WordCloudTerm) []WordCloudTerm {
 // --- topic drill-down (HR only) ---
 
 type TopicTrendPoint struct {
-	Month string  `json:"month"`
-	Score float64 `json:"score"`
+	Month string   `json:"month"`
+	Score *float64 `json:"score"`
 }
 
 type TopicSubIssue struct {
@@ -215,26 +217,47 @@ type TopicSubIssue struct {
 // TopicDrilldown is the only response carrying respondent text. SampleQuotes holds strings
 // that were redacted before they were ever stored, and the route is HR-gated.
 type TopicDrilldown struct {
-	TopicID          string            `json:"topicId"`
-	Label            Localized         `json:"label"`
-	DepartmentID     string            `json:"departmentId,omitempty"`
-	DepartmentName   string            `json:"departmentName,omitempty"`
-	Score            float64           `json:"score"`
-	CompanyAverage   float64           `json:"companyAverage"`
-	RespondentCount  int64             `json:"respondentCount"`
-	PercentageTagged int               `json:"percentageTagged"`
-	Trend            []TopicTrendPoint `json:"trend"`
-	SubIssues        []TopicSubIssue   `json:"subIssues"`
-	Sentiment        Sentiment         `json:"sentiment"`
-	SampleQuotes     []string          `json:"sampleQuotes"`
+	PeriodID           string            `json:"periodId"`
+	ScopeResponseCount int64             `json:"scopeResponseCount"`
+	TopicID            string            `json:"topicId"`
+	Label              Localized         `json:"label"`
+	DepartmentID       string            `json:"departmentId,omitempty"`
+	DepartmentName     string            `json:"departmentName,omitempty"`
+	Score              float64           `json:"score"`
+	CompanyAverage     float64           `json:"companyAverage"`
+	RespondentCount    int64             `json:"respondentCount"`
+	PercentageTagged   int               `json:"percentageTagged"`
+	Trend              []TopicTrendPoint `json:"trend"`
+	SubIssues          []TopicSubIssue   `json:"subIssues"`
+	Sentiment          Sentiment         `json:"sentiment"`
+	SampleQuotes       []string          `json:"sampleQuotes"`
 }
 
 func NewTopicTrend(points []analytics.TopicTrendPoint) []TopicTrendPoint {
 	out := make([]TopicTrendPoint, 0, len(points))
 	for _, p := range points {
-		out = append(out, TopicTrendPoint{Month: p.Month, Score: p.Score})
+		out = append(out, TopicTrendPoint{Month: p.Month, Score: &p.Score})
 	}
 	return out
+}
+
+// NewTopicTrendWindow retains missing/suppressed months as null without exposing counts.
+func NewTopicTrendWindow(points []analytics.TopicTrendPoint, period *models.SurveyPeriod) []TopicTrendPoint {
+	values := make(map[string]float64, len(points))
+	for _, point := range points {
+		values[point.Month] = point.Score
+	}
+	result := make([]TopicTrendPoint, 0, 6)
+	last := int(period.Year)*12 + int(period.Month) - 1
+	for month := last - 5; month <= last; month++ {
+		label := fmt.Sprintf("%04d-%02d", month/12, month%12+1)
+		point := TopicTrendPoint{Month: label}
+		if score, exists := values[label]; exists {
+			point.Score = &score
+		}
+		result = append(result, point)
+	}
+	return result
 }
 
 func NewSubIssues(issues []models.TopicSubIssue) []TopicSubIssue {

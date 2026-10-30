@@ -514,11 +514,16 @@ func (h *DashboardHandler) Alerts(c *fiber.Ctx) error {
 // topicUnavailable answers 404 with a machine-readable reason, so the UI can tell HR whether
 // the topic is hidden by the n<5 rule ("suppressed") or comments are still waiting for AI
 // analysis ("analysis_pending"). Neither reason reveals anything about individual answers.
-func (h *DashboardHandler) topicUnavailable(c *fiber.Ctx, orgID, periodID, message string) error {
+func (h *DashboardHandler) topicUnavailable(c *fiber.Ctx, orgID, periodID, message string, label models.Localized, departmentName string) error {
 	var pending int64
-	if err := h.db.Model(&models.SurveyResponse{}).
-		Where("org_id = ? AND period_id = ? AND analysis_status IN ?", orgID, periodID, []string{"pending", "processing", "failed"}).
-		Count(&pending).Error; err != nil {
+	query := h.db.Model(&models.SurveyResponse{}).
+		Where("org_id = ? AND period_id = ? AND analysis_status IN ?", orgID, periodID, []string{"pending", "processing", "failed"})
+	if department := c.Query("department"); department == analytics.UnassignedDepartmentID {
+		query = query.Where("department_id IS NULL")
+	} else if department != "" {
+		query = query.Where("department_id = ?", department)
+	}
+	if err := query.Count(&pending).Error; err != nil {
 		return err
 	}
 	reason := "suppressed"
@@ -530,6 +535,8 @@ func (h *DashboardHandler) topicUnavailable(c *fiber.Ctx, orgID, periodID, messa
 		"reason":          reason,
 		"pendingAnalysis": pending,
 		"periodId":        periodID,
+		"topicId":         c.Params("id"), "label": label,
+		"departmentId": c.Query("department"), "departmentName": departmentName,
 	})
 }
 
@@ -558,8 +565,10 @@ func (h *DashboardHandler) TopicDrilldown(c *fiber.Ctx) error {
 		}
 		topicLabel = emerging.Label
 	}
-	if departmentID := c.Query("department"); departmentID != "" {
-		departmentName := "Unassigned"
+	departmentID := c.Query("department")
+	departmentName := ""
+	if departmentID != "" {
+		departmentName = "Unassigned"
 		if departmentID != analytics.UnassignedDepartmentID {
 			var department models.Department
 			if err := h.db.Where("org_id = ? AND id = ?", orgID, departmentID).First(&department).Error; err != nil {
@@ -567,60 +576,24 @@ func (h *DashboardHandler) TopicDrilldown(c *fiber.Ctx) error {
 			}
 			departmentName = department.Name
 		}
-		detail, err := statsSvc.DepartmentTopicDetail(period, topicID, departmentID)
-		if err != nil {
-			return err
-		}
-		if detail == nil {
-			return h.topicUnavailable(c, orgID, period.ID, "department topic data is hidden or unavailable")
-		}
-		return c.JSON(dto.TopicDrilldown{
-			TopicID: topicID, Label: topicLabel,
-			DepartmentID: departmentID, DepartmentName: departmentName,
-			Score: detail.Score, CompanyAverage: detail.CompanyAverage,
-			RespondentCount: detail.RespondentCount, PercentageTagged: detail.PercentageTagged,
-			Trend: dto.NewTopicTrend(detail.Trend), SubIssues: []dto.TopicSubIssue{},
-			Sentiment: detail.Sentiment, SampleQuotes: detail.SampleQuotes,
-		})
 	}
-
-	stats, err := statsSvc.TopicStats(period.ID, topicID)
+	detail, err := statsSvc.DepartmentTopicDetail(period, topicID, departmentID)
 	if err != nil {
 		return err
 	}
-	if stats.RespondentCount < models.MinGroupSize {
-		return h.topicUnavailable(c, orgID, period.ID, "topic data is hidden or unavailable")
+	if detail == nil {
+		return h.topicUnavailable(c, orgID, period.ID, "topic data is hidden or unavailable", topicLabel, departmentName)
 	}
-	trend, err := statsSvc.TopicTrend(period, topicID, 6)
-	if err != nil {
-		return err
-	}
-	sentiment, err := statsSvc.SentimentSplit(period.ID)
-	if err != nil {
-		return err
-	}
-
-	var subIssues []models.TopicSubIssue
-	if err := h.db.Where("topic_id = ?", topicID).Order("percentage DESC").Find(&subIssues).Error; err != nil {
-		return err
-	}
-
-	quoteTexts, err := statsSvc.TopicSampleQuotes(period.ID, topicID, "")
-	if err != nil {
-		return err
-	}
-
+	// Legacy sub-issues have no organization/period/department scope, so they cannot
+	// represent the current selection. Keep the compatibility field empty.
 	return c.JSON(dto.TopicDrilldown{
-		TopicID:          topicID,
-		Label:            topicLabel,
-		Score:            stats.Score,
-		CompanyAverage:   stats.CompanyAverage,
-		RespondentCount:  stats.RespondentCount,
-		PercentageTagged: stats.PercentageTagged,
-		Trend:            dto.NewTopicTrend(trend),
-		SubIssues:        dto.NewSubIssues(subIssues),
-		Sentiment:        sentiment,
-		SampleQuotes:     quoteTexts,
+		TopicID: topicID, Label: topicLabel, PeriodID: period.ID,
+		DepartmentID: departmentID, DepartmentName: departmentName,
+		Score: detail.Score, CompanyAverage: detail.CompanyAverage,
+		RespondentCount: detail.RespondentCount, PercentageTagged: detail.PercentageTagged,
+		ScopeResponseCount: detail.ScopeResponseCount,
+		Trend:              dto.NewTopicTrendWindow(detail.Trend, period), SubIssues: []dto.TopicSubIssue{},
+		Sentiment: detail.Sentiment, SampleQuotes: detail.SampleQuotes,
 	})
 }
 
