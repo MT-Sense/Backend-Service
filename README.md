@@ -166,6 +166,17 @@ Auth: `Authorization: Bearer <accessToken>` ทุก endpoint ยกเว้�
 | POST | `/api/survey-periods/:id/import/preview` | ตรวจไฟล์ Excel และ Department โดยยังไม่บันทึก |
 | POST | `/api/survey-periods/:id/import` | วิเคราะห์และนำเข้าคำตอบจาก Excel แบบครบทั้งไฟล์ |
 
+รายการรอบสำรวจรองรับ server-side pagination ผ่าน `GET /api/survey-periods?page=1&pageSize=10`
+โดยคืน `{items, total, page, pageSize, latestPeriod}` และใช้ LIMIT/OFFSET จริง
+pageSize มีค่าเริ่มต้น 10 สูงสุด 100; page ต้องเป็นจำนวนเต็มบวก หากเกินหน้าสุดท้ายจะคืนหน้าสุดท้าย
+รายการว่างคืน items=[] และ page=1 ข้อมูลทุกส่วนจำกัดตามองค์กร รวมถึงจำนวนคำตอบและ latestPeriod
+ซึ่งระบุปี/เดือนล่าสุดเพื่อเปิดรอบถัดไปได้ถูกต้องแม้อยู่หน้าที่เก่ากว่า นับคำตอบเฉพาะรายการในหน้านั้นด้วย query รวมหนึ่งครั้ง
+หากไม่ส่ง page/pageSize จะยังคืน array ทั้งหมดแบบเดิมสำหรับตัวเลือกบน Dashboard
+หน้าเว็บเรียก API ทุกครั้งที่เปลี่ยนหน้าหรือจำนวนแถว และยังไม่ได้เพิ่มแคชแต่ละหน้า
+
+ทดสอบ pagination กับ PostgreSQL แยกได้โดยตั้ง `PERIODS_TEST_DATABASE_URL` แล้วรัน
+`go test ./internal/router -run TestSurveyPeriodPagination -v`
+
 หน้า **รอบสำรวจ** ให้ HR เลือกไฟล์ `.xlsx` ในรอบที่ต้องการ (ไม่เกิน 5 MB/250 แถว)
 แผ่นงานแรกต้องมีหัวคอลัมน์เรียง A–D: `Department`, `ตำแหน่ง`, `คะแนน`, `ข้อความ`
 โดยคะแนนเป็นจำนวนเต็ม 1–5, ข้อความต้องไม่ว่าง และชื่อ Department ต้องตรงกับแผนกในองค์กร
@@ -178,6 +189,13 @@ Auth: `Authorization: Bearer <accessToken>` ทุก endpoint ยกเว้�
 | PATCH | `/api/feed/:id/moderate` |
 | GET/POST | `/api/hr/departments` | ดูรายชื่อและสร้าง Department ขององค์กร |
 | PATCH/DELETE | `/api/hr/departments/:id` | เปลี่ยนชื่อหรือลบ Department ที่ยังไม่มีข้อมูลอ้างอิง |
+
+หน้า Department ใช้ server-side pagination ผ่าน `GET /api/hr/departments?page=1&pageSize=10`
+คืน `{items, total, page, pageSize}` พร้อม createdAt จากฐานข้อมูล เรียงตามชื่อและ id
+pageSize เริ่มต้น 10 สูงสุด 100 และคืนหน้าสุดท้ายที่ยังมีข้อมูลเมื่อเลขหน้าเกินขอบเขต
+หากไม่ส่ง page/pageSize ยังคงคืน array ทั้งหมดสำหรับ dropdown ที่ใช้ API เดิม
+ทดสอบกับ PostgreSQL แยกโดยตั้ง `DEPARTMENTS_TEST_DATABASE_URL` และรัน
+`go test ./internal/router -run TestDepartmentPagination -v`
 
 HR เปิดหน้า `/departments` เพื่อสร้าง Department และใช้รหัส `organizations.join_code` จากหน้า Settings แจกพนักงาน
 พนักงานกรอกรหัสบริษัทที่หน้า `/join` จากนั้นเลือก Department ของบริษัทจาก dropdown ในหน้าสร้างบัญชี

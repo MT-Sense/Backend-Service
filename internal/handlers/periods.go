@@ -34,23 +34,21 @@ func NewPeriodsHandler(db *gorm.DB, stats *analytics.Service, ai *aiservice.Clie
 	return &PeriodsHandler{db: db, stats: stats, ai: ai, kb: kb, queue: queue, mail: mail}
 }
 
-// List returns every survey period for the org, newest first, with response counts.
+// List returns an array by default or a page when page/pageSize is provided.
 func (h *PeriodsHandler) List(c *fiber.Ctx) error {
+	if c.Context().QueryArgs().Has("page") || c.Context().QueryArgs().Has("pageSize") {
+		return h.ListPage(c)
+	}
 	orgID := middleware.OrgID(c)
-	stats := h.stats.WithOrg(orgID)
 
 	var periods []models.SurveyPeriod
 	if err := h.db.Where("org_id = ?", orgID).Order("year DESC, month DESC").Find(&periods).Error; err != nil {
 		return err
 	}
 
-	counts := make(map[string]int64, len(periods))
-	for _, p := range periods {
-		n, err := stats.TotalRespondents(p.ID)
-		if err != nil {
-			return err
-		}
-		counts[p.ID] = n
+	counts, err := periodResponseCounts(h.db, orgID, periods)
+	if err != nil {
+		return err
 	}
 
 	return c.JSON(dto.NewSurveyPeriodList(periods, counts))

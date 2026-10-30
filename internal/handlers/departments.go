@@ -3,6 +3,7 @@ package handlers
 import (
 	"errors"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gofiber/fiber/v2"
@@ -24,23 +25,35 @@ func validDepartmentName(name string) bool {
 }
 
 type departmentWithCode struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	JoinCode string `json:"joinCode"`
+	ID        string     `json:"id"`
+	Name      string     `json:"name"`
+	JoinCode  string     `json:"joinCode"`
+	CreatedAt *time.Time `json:"createdAt"`
+}
+
+// A missing historical timestamp stays unknown instead of inventing a creation date.
+func newDepartmentWithCode(department models.Department) departmentWithCode {
+	var createdAt *time.Time
+	if !department.CreatedAt.IsZero() {
+		timestamp := department.CreatedAt
+		createdAt = &timestamp
+	}
+	return departmentWithCode{
+		ID: department.ID, Name: department.Name, JoinCode: departmentCode(department), CreatedAt: createdAt,
+	}
 }
 
 func (h *DepartmentsHandler) List(c *fiber.Ctx) error {
+	if c.Context().QueryArgs().Has("page") || c.Context().QueryArgs().Has("pageSize") {
+		return h.ListPage(c)
+	}
 	var departments []models.Department
 	if err := h.db.Where("org_id = ?", middleware.OrgID(c)).Order("name").Find(&departments).Error; err != nil {
 		return err
 	}
 	out := make([]departmentWithCode, 0, len(departments))
 	for _, d := range departments {
-		code := ""
-		if d.JoinCode != nil {
-			code = *d.JoinCode
-		}
-		out = append(out, departmentWithCode{ID: d.ID, Name: d.Name, JoinCode: code})
+		out = append(out, newDepartmentWithCode(d))
 	}
 	return c.JSON(out)
 }
@@ -70,7 +83,7 @@ func (h *DepartmentsHandler) Create(c *fiber.Ctx) error {
 			return tx.Model(&models.Organization{}).Where("id = ?", orgID).Update("collect_department", true).Error
 		})
 		if err == nil {
-			return c.Status(fiber.StatusCreated).JSON(departmentWithCode{ID: department.ID, Name: department.Name, JoinCode: code})
+			return c.Status(fiber.StatusCreated).JSON(newDepartmentWithCode(department))
 		}
 		if !isUniqueViolation(err) {
 			return err
@@ -106,7 +119,7 @@ func (h *DepartmentsHandler) Update(c *fiber.Ctx) error {
 		return err
 	}
 	if department.Name == req.Name {
-		return c.JSON(departmentWithCode{ID: department.ID, Name: department.Name, JoinCode: departmentCode(department)})
+		return c.JSON(newDepartmentWithCode(department))
 	}
 	if err := h.db.Model(&department).Where("org_id = ?", orgID).Update("name", req.Name).Error; err != nil {
 		if isUniqueViolation(err) {
@@ -115,7 +128,7 @@ func (h *DepartmentsHandler) Update(c *fiber.Ctx) error {
 		return err
 	}
 	department.Name = req.Name
-	return c.JSON(departmentWithCode{ID: department.ID, Name: department.Name, JoinCode: departmentCode(department)})
+	return c.JSON(newDepartmentWithCode(department))
 }
 
 func departmentCode(department models.Department) string {
