@@ -105,6 +105,9 @@ func matchRouting(rules []models.RoutingRule, text string) (string, string, stri
 	return "", "", "ไม่พบกฎ — รอ HR คัดแยกหัวข้อใหม่"
 }
 func (h *AutomationHandler) ListRoutingCases(c *fiber.Ctx) error {
+	if c.Context().QueryArgs().Has("page") || c.Context().QueryArgs().Has("pageSize") {
+		return h.ListRoutingCasePage(c)
+	}
 	rows := []models.RoutingCase{}
 	if err := h.db.Where("org_id = ? AND title NOT LIKE ?", middleware.OrgID(c), "[ตัวอย่าง]%").Order("created_at DESC").Limit(100).Find(&rows).Error; err != nil {
 		return err

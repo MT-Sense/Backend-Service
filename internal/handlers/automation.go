@@ -191,6 +191,9 @@ func (h *AutomationHandler) TestJira(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"message": "เชื่อมต่อ Jira และอ่าน Project ได้สำเร็จ (ยังไม่ได้ทดสอบการสร้างงาน)"})
 }
 func (h *AutomationHandler) ListProposals(c *fiber.Ctx) error {
+	if c.Context().QueryArgs().Has("page") || c.Context().QueryArgs().Has("pageSize") {
+		return h.ListProposalPage(c)
+	}
 	rows := []models.AutomationProposal{}
 	q := h.db.Where("org_id = ? AND demo = false", middleware.OrgID(c))
 	if p := c.Query("period"); p != "" {
